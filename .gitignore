@@ -1,0 +1,19 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Sorties / caches de traitement
+*.log
+gps_cache/
+phototagger_out/
+rapport_*.csv
+rapport_*.txt
+bench_llm.csv
+bench_llm.txt
+results.json
+progress.json
+manifest.json

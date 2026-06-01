@@ -1,0 +1,375 @@
+--[[
+TagSelection.lua — Tague la SÉLECTION et écrit les mots-clés DANS le catalogue.
+
+Flux complet :
+  1. Dialogue natif Lightroom : choix des options (modèle, espèces, GPS…).
+  2. Export de la sélection en JPEG + manifest.json (GPS, chemin, cible XMP).
+  3. Lancement BLOQUANT du Python (selection_runner.py --no-questions …) :
+     il calcule les tags et écrit results.json {tags_by_id: {uuid: [tags]}}.
+  4. Lecture de results.json et écriture des mots-clés dans le catalogue via
+     catalog:withWriteAccessDo (seul Lua peut écrire dans LrC en marche).
+
+L'écriture catalogue est officielle et non destructive : les mots-clés
+apparaissent immédiatement dans le panneau Mots-clés, photos encore
+sélectionnées, sans réimport.
+]]
+
+local LrApplication   = import "LrApplication"
+local LrTasks         = import "LrTasks"
+local LrDialogs       = import "LrDialogs"
+local LrExportSession = import "LrExportSession"
+local LrPathUtils     = import "LrPathUtils"
+local LrFileUtils     = import "LrFileUtils"
+local LrDate          = import "LrDate"
+local LrView          = import "LrView"
+local LrBinding       = import "LrBinding"
+local LrFunctionContext = import "LrFunctionContext"
+
+-- >>> À ADAPTER si besoin <<<
+local PROJECT_DIR = "/Users/laurentvoillot/Claude/photo-tagger"
+local PYTHON_BIN  = PROJECT_DIR .. "/.venv/bin/python"
+local RUNNER      = PROJECT_DIR .. "/selection_runner.py"
+
+local function shellQuote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+-- ---- JSON minimal (écriture) ----
+local function jsonEscape(s)
+    s = tostring(s)
+    s = s:gsub("\\", "\\\\"):gsub('"', '\\"')
+    s = s:gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
+    return s
+end
+local function jsonValue(v)
+    if v == nil then return "null"
+    elseif type(v) == "boolean" then return v and "true" or "false"
+    elseif type(v) == "number" then return string.format("%.8g", v)
+    else return '"' .. jsonEscape(v) .. '"' end
+end
+
+-- ---- JSON minimal (lecture de results.json) ----
+-- Parse le sous-objet tags_by_id : { "uuid": ["tag", ...], ... }.
+-- Suffisant pour notre format contrôlé (pas de JSON arbitraire).
+local function parseResults(text)
+    local result = {}
+    local body = text:match('"tags_by_id"%s*:%s*(%b{})')
+    if not body then return result end
+    -- Itère chaque "clé": [ ... ]. Les valeurs de tags ne contiennent pas de
+    -- guillemets (le Python ne produit que des mots-clés simples), donc un motif
+    -- simple "([^"]*)" suffit et reste robuste.
+    for key, arr in body:gmatch('"([^"]+)"%s*:%s*(%b[])') do
+        local tags = {}
+        for tag in arr:gmatch('"([^"]*)"') do
+            tags[#tags + 1] = tag
+        end
+        result[key] = tags
+    end
+    return result
+end
+
+local function showOptionsDialog()
+    return LrFunctionContext.callWithContext("phototagger_opts", function(context)
+        local f = LrView.osFactory()
+        local props = LrBinding.makePropertyTable(context)
+
+        -- Liste des modèles ; le premier est le défaut sélectionné.
+        local modelItems = {
+            { title = "qwen3-vl:30b (qualité + animaux)", value = "qwen3-vl:30b" },
+            { title = "qwen2.5vl:7b (rapide, FR)",        value = "qwen2.5vl:7b" },
+        }
+        props.model = modelItems[1].value  -- défaut = 1er de la liste
+        props.species = false
+        props.onlineSpecies = true
+        props.onlinePlace = false
+        props.writeXmp = false
+        props.suffix = "_AI"  -- suffixe par défaut, modifiable, peut être vide
+
+        local c = f:column{
+            bind_to_object = props,  -- résout les bindings dès la création (popup non vide)
+            spacing = f:control_spacing(),
+            f:static_text{ title = "Options de taggage de la sélection", font = "<system/bold>" },
+            f:row{
+                f:static_text{ title = "Modèle :", width = 110 },
+                f:popup_menu{
+                    value = LrView.bind("model"),
+                    items = modelItems,
+                    width = 280,
+                },
+            },
+            f:row{
+                f:static_text{ title = "Suffixe des tags :", width = 110 },
+                f:edit_field{
+                    value = LrView.bind("suffix"),
+                    width = 120,
+                    immediate = true,
+                },
+                f:static_text{ title = "(ex. _AI ; laisser vide pour aucun suffixe)" },
+            },
+            f:checkbox{ title = "Passe 2 espèces (BioCLIP, expérimental)", value = LrView.bind("species") },
+            f:checkbox{ title = "Filtrer les espèces par GPS via GBIF (réseau)", value = LrView.bind("onlineSpecies") },
+            f:checkbox{ title = "Enrichir les lieux via Nominatim/OSM (réseau)", value = LrView.bind("onlinePlace") },
+            f:checkbox{ title = "Écrire aussi des sidecars .xmp", value = LrView.bind("writeXmp") },
+        }
+
+        local res = LrDialogs.presentModalDialog{
+            title = "Photo Tagger — options",
+            contents = c,
+            actionVerb = "Lancer",
+        }
+        if res ~= "ok" then return nil end
+        return {
+            model = props.model,
+            species = props.species,
+            onlineSpecies = props.onlineSpecies,
+            onlinePlace = props.onlinePlace,
+            writeXmp = props.writeXmp,
+            suffix = props.suffix or "",
+        }
+    end)
+end
+
+LrTasks.startAsyncTask(function()
+    local catalog = LrApplication.activeCatalog()
+    local photos = catalog:getTargetPhotos()
+    if not photos or #photos == 0 then
+        LrDialogs.message("Photo Tagger", "Aucune photo sélectionnée.", "warning")
+        return
+    end
+
+    local opts = showOptionsDialog()
+    if not opts then return end  -- annulé
+
+    -- 1) Dossier de travail temporaire.
+    local stamp = LrDate.timeToUserFormat(LrDate.currentTime(), "%Y%m%d_%H%M%S")
+    local workDir = LrPathUtils.child(LrPathUtils.getStandardFilePath("temp"),
+                                      "phototagger_" .. stamp)
+    LrFileUtils.createAllDirectories(workDir)
+
+    -- 2) Export JPEG de la sélection.
+    local exportSettings = {
+        LR_export_destinationType = "specificFolder",
+        LR_export_destinationPathPrefix = workDir,
+        LR_export_useSubfolder = false,
+        LR_format = "JPEG",
+        LR_jpeg_quality = 0.8,
+        LR_size_doConstrain = true,
+        LR_size_maxHeight = 2048,
+        LR_size_maxWidth = 2048,
+        LR_size_resolution = 240,
+        LR_collisionHandling = "rename",
+        LR_includeVideoFiles = false,
+        LR_embeddedMetadataOption = "all",
+        LR_removeLocationMetadata = false,
+        LR_renamingTokensOn = true,
+        LR_tokens = "{{naming_sequenceNumber_5Digit}}",
+        LR_tokenCustomString = "",
+    }
+    local session = LrExportSession({ photosToExport = photos, exportSettings = exportSettings })
+
+    local jpegByLocalId = {}
+    session:doExportOnCurrentTask()
+    for _, rendition in session:renditions() do
+        local ok, path = rendition:waitForRender()
+        if ok then
+            jpegByLocalId[rendition.photo.localIdentifier] = LrPathUtils.leafName(path)
+        end
+    end
+
+    -- 3) Manifeste. On utilise l'UUID Lightroom (getRawMetadata "uuid") comme id
+    --    stable, et on garde une table localId -> photo pour l'écriture finale.
+    local photoByUuid = {}
+    local parts = { "{\n", '  "catalog": ' .. jsonValue(catalog:getPath()) .. ",\n", '  "photos": [\n' }
+    local n = 0
+    for _, photo in ipairs(photos) do
+        local jpeg = jpegByLocalId[photo.localIdentifier]
+        if jpeg then
+            n = n + 1
+            local uuid = photo:getRawMetadata("uuid") or tostring(photo.localIdentifier)
+            local origPath = photo:getRawMetadata("path")
+            -- "fileName" n'est PAS une clé raw metadata valide -> on dérive le nom
+            -- depuis le chemin (toujours disponible en raw).
+            local fileName = LrPathUtils.leafName(origPath)
+            local folder = LrPathUtils.parent(origPath)
+            local base = LrPathUtils.removeExtension(fileName)
+            local xmpPath = LrPathUtils.child(folder, base .. ".xmp")
+            local gps = photo:getRawMetadata("gps")
+            local lat, lon, hasGps = nil, nil, false
+            if gps and gps.latitude and gps.longitude then
+                lat, lon, hasGps = gps.latitude, gps.longitude, true
+            end
+            photoByUuid[uuid] = photo
+            local sep = (n > 1) and ",\n" or ""
+            parts[#parts + 1] = sep .. "    {"
+                .. '"id": '      .. jsonValue(uuid) .. ", "
+                .. '"file": '    .. jsonValue(jpeg) .. ", "
+                .. '"name": '    .. jsonValue(fileName) .. ", "
+                .. '"folder": '  .. jsonValue(folder) .. ", "
+                .. '"xmp": '     .. jsonValue(xmpPath) .. ", "
+                .. '"lat": '     .. jsonValue(lat) .. ", "
+                .. '"lon": '     .. jsonValue(lon) .. ", "
+                .. '"has_gps": ' .. jsonValue(hasGps) .. "}"
+        end
+    end
+    parts[#parts + 1] = "\n  ]\n}\n"
+    local manifestPath = LrPathUtils.child(workDir, "manifest.json")
+    local mf = io.open(manifestPath, "w"); mf:write(table.concat(parts)); mf:close()
+
+    -- 4) Lancement NON BLOQUANT du Python (en arrière-plan) pour pouvoir afficher
+    --    l'avancement pendant le traitement. Un fichier sentinelle "done.flag"
+    --    contenant le code retour signale la fin ; "progress.json" donne l'état.
+    local stdoutPath = LrPathUtils.child(workDir, "python_stdout.txt")
+    local donePath   = LrPathUtils.child(workDir, "done.flag")
+    local progPath   = LrPathUtils.child(workDir, "progress.json")
+
+    local pycmd = shellQuote(PYTHON_BIN) .. " " .. shellQuote(RUNNER)
+        .. " " .. shellQuote(manifestPath) .. " --no-questions"
+        .. " --model " .. shellQuote(opts.model)
+    if opts.species        then pycmd = pycmd .. " --species" end
+    if not opts.onlineSpecies then pycmd = pycmd .. " --no-online-species" end
+    if opts.onlinePlace    then pycmd = pycmd .. " --online-place" end
+    if opts.writeXmp       then pycmd = pycmd .. " --write-xmp" end
+
+    -- sous-shell détaché : lance le Python, mémorise son PID (pour pouvoir le
+    -- tuer en cas d'annulation), puis écrit son code retour dans done.flag.
+    local pidPath = LrPathUtils.child(workDir, "python.pid")
+    local shell = "( " .. pycmd .. " > " .. shellQuote(stdoutPath) .. " 2>&1 & "
+        .. "PID=$! ; echo $PID > " .. shellQuote(pidPath) .. " ; "
+        .. "wait $PID ; echo $? > " .. shellQuote(donePath) .. " ) &"
+    LrTasks.execute("/bin/sh -c " .. shellQuote(shell))
+
+    -- Lit la progression écrite par Python (done/total/current).
+    local function readProgress()
+        if not LrFileUtils.exists(progPath) then return nil end
+        local pf = io.open(progPath, "r"); if not pf then return nil end
+        local t = pf:read("*a"); pf:close()
+        local done = tonumber(t:match('"done"%s*:%s*(%d+)'))
+        local total = tonumber(t:match('"total"%s*:%s*(%d+)'))
+        local current = t:match('"current"%s*:%s*"([^"]*)"')
+        return done, total, current
+    end
+
+    -- Fenêtre de progression native Lightroom (barre en bas + annulation).
+    local rc = 0
+    LrFunctionContext.callWithContext("phototagger_progress", function(ctx)
+        local progress = LrDialogs.showModalProgressDialog{
+            title = "Photo Tagger — taggage en cours",
+            caption = "Préparation… (le 1er chargement du modèle peut être long)",
+            cannotCancel = false,
+            functionContext = ctx,
+        }
+        while true do
+            if progress:isCanceled() then
+                -- Tue le process Python, mais on taguera quand même les photos
+                -- déjà traitées (results.json est écrit au fil de l'eau).
+                if LrFileUtils.exists(pidPath) then
+                    local pf = io.open(pidPath, "r")
+                    local pid = pf and pf:read("*a")
+                    if pf then pf:close() end
+                    if pid then
+                        pid = pid:gsub("%s+", "")
+                        if pid ~= "" then
+                            LrTasks.execute("/bin/kill " .. pid .. " 2>/dev/null")
+                        end
+                    end
+                end
+                rc = -2  -- code interne : annulé, mais on tague le partiel
+                break
+            end
+            if LrFileUtils.exists(donePath) then
+                local df = io.open(donePath, "r")
+                rc = tonumber((df:read("*a")) or "0") or 0
+                df:close()
+                progress:setPortionComplete(1, 1)
+                break
+            end
+            local done, total, current = readProgress()
+            if done and total and total > 0 then
+                progress:setPortionComplete(done, total)
+                progress:setCaption(string.format("Photo %d / %d : %s",
+                    done, total, current or ""))
+            end
+            LrTasks.sleep(0.5)
+        end
+        progress:done()
+    end)
+
+    -- rc == -2 : annulé par l'utilisateur, mais on continue pour taguer les
+    -- photos DÉJÀ traitées (results.json partiel). rc > 0 : vraie erreur.
+    local wasCanceled = (rc == -2)
+    if rc ~= 0 and not wasCanceled then
+        LrDialogs.message("Photo Tagger",
+            "Le script Python a échoué (code " .. tostring(rc) .. ").\n"
+            .. "Voir python_stdout.txt dans :\n" .. workDir, "critical")
+        return
+    end
+
+    -- 5) Lecture des résultats et écriture des mots-clés DANS le catalogue.
+    --    Après une annulation, on laisse un court instant le process se terminer
+    --    et finir d'écrire results.json.
+    if wasCanceled then LrTasks.sleep(1.0) end
+    local resultsPath = LrPathUtils.child(workDir, "results.json")
+    if not LrFileUtils.exists(resultsPath) then
+        LrDialogs.message("Photo Tagger",
+            wasCanceled and "Annulé : aucune photo n'avait encore été taguée."
+                or ("results.json introuvable.\n" .. workDir),
+            wasCanceled and "info" or "critical")
+        return
+    end
+    local rf = io.open(resultsPath, "r"); local rtext = rf:read("*a"); rf:close()
+    local tagsByUuid = parseResults(rtext)
+
+    local suffix = opts.suffix or ""
+
+    -- Base d'un mot-clé = sa forme SANS le suffixe (pour la déduplication).
+    -- Ainsi "herbe" et "herbe_AI" ont la même base "herbe".
+    local function baseOf(name)
+        local lower = name:lower()
+        if suffix ~= "" then
+            local s = suffix:lower()
+            if #lower > #s and lower:sub(-#s) == s then
+                return lower:sub(1, #lower - #s)
+            end
+        end
+        return lower
+    end
+
+    local nPhotos, nTags, nSkipped = 0, 0, 0
+    catalog:withWriteAccessDo("Ajout des mots-clés IA", function()
+        for uuid, tags in pairs(tagsByUuid) do
+            local photo = photoByUuid[uuid]
+            if photo then
+                nPhotos = nPhotos + 1
+
+                -- Mots-clés déjà présents sur la photo, indexés par base.
+                local existing = {}
+                for _, kw in ipairs(photo:getRawMetadata("keywords") or {}) do
+                    existing[baseOf(kw:getName())] = true
+                end
+
+                for _, tag in ipairs(tags) do
+                    local base = baseOf(tag)  -- le tag IA peut déjà finir par le suffixe
+                    if existing[base] then
+                        nSkipped = nSkipped + 1
+                    else
+                        local finalName = tag .. suffix
+                        local kw = catalog:createKeyword(finalName, {}, true, nil, true)
+                        if kw then
+                            photo:addKeyword(kw)
+                            nTags = nTags + 1
+                            existing[base] = true  -- évite les doublons dans le même lot
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    LrDialogs.message("Photo Tagger",
+        (wasCanceled and "Traitement ANNULÉ — seules les photos déjà traitées "
+            .. "ont été taguées.\n\n" or "Mots-clés écrits dans le catalogue.\n")
+        .. nPhotos .. " photo(s), " .. nTags .. " mot(s)-clé(s) ajouté(s)"
+        .. ((nSkipped > 0) and (", " .. nSkipped .. " ignoré(s) (déjà présents)") or "")
+        .. ".\n\n"
+        .. "Rapport : " .. workDir, "info")
+end)

@@ -1,0 +1,15 @@
+# Cœur du pipeline
+pillow>=10.0.0
+rawpy>=0.18.0
+tifffile>=2024.1.0
+imagecodecs>=2024.1.0
+requests>=2.31.0
+reverse_geocoder>=1.5.1
+PyYAML>=6.0.0
+
+# Interface graphique optionnelle
+PyQt6>=6.5.0
+
+# Passe 2 espèces (BioCLIP) — optionnel
+torch>=2.0.0
+open_clip_torch>=3.0.0

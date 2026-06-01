@@ -1,0 +1,269 @@
+"""
+test_report.py — MODE TEST (lecture seule) du Photo Tagger.
+
+Objectif : valider toute la chaîne sans aucun risque pour la base Lightroom.
+  - Le catalogue n'est ouvert qu'en lecture seule (mode=ro, immutable=1).
+  - AUCUN fichier XMP n'est écrit, la base Lightroom n'est JAMAIS modifiée.
+  - Sortie sous la forme demandée : « numéro_dossier/nom_de_fichier → tags ».
+  - Produit aussi un rapport CSV (colonne `statut` pour repérer les
+    photos indisponibles) et un fichier texte.
+
+À ce stade, le pipeline de tags (LLM + espèces) n'est pas branché : le rapport
+montre la SOURCE d'image effectivement résolue par la cascade et l'état GPS.
+Les colonnes de tags seront remplies quand pipeline.py sera connecté.
+
+Pré-vol volumes : on détecte une seule fois au démarrage si un volume requis
+est absent (cf. log_panel.preflight_volumes). Comme un volume ne se montera pas
+en cours de route, on ne répète jamais ce message.
+
+Usage :
+    .venv/bin/python test_report.py "/Volumes/X10/LR-v15/LR-v15.lrcat" \
+        --scope "2020-0406 Orion Test1" --limit 20
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from collections import defaultdict
+from pathlib import Path
+
+from catalog_reader import CatalogReader, PhotoRecord
+from image_source import ImageResolver, SourceKind, ResolvedImage
+from log_panel import RunStats, get_logger, preflight_volumes, setup_logger
+
+# Étiquettes lisibles pour la source résolue.
+_KIND_LABEL = {
+    SourceKind.PREVIEW: "aperçu standard",
+    SourceKind.SMART: "Smart Preview",
+    SourceKind.ORIGINAL: "original",
+}
+
+
+def _folder_numbers(records: list[PhotoRecord]) -> dict[str, str]:
+    """Attribue un numéro stable à chaque dossier rencontré (0001, 0002, ...)."""
+    mapping: dict[str, str] = {}
+    n = 0
+    for r in records:
+        if r.folder_abs not in mapping:
+            n += 1
+            mapping[r.folder_abs] = f"{n:04d}"
+    return mapping
+
+
+def run_test(
+    lrcat: str,
+    scope: str | None,
+    limit: int | None,
+    gps_only: bool,
+    order: tuple[SourceKind, ...],
+    out_dir: str | None,
+    tag: bool = False,
+    model: str = "qwen3-vl:30b",
+    online_species: bool = True,
+    species_pass: bool = False,
+) -> None:
+    out = Path(out_dir) if out_dir else Path.cwd()
+    stats = RunStats()
+    log = setup_logger(log_dir=out, stats=stats)
+    log.info("=== MODE TEST (lecture seule, aucune écriture) ===")
+
+    # Pipeline de tags (optionnel) : passe 1 LLM + GPS + passe 2 espèces.
+    pipeline = None
+    if tag:
+        from pipeline import TaggingPipeline, OllamaVision
+        from gps_context import GpsContext
+
+        gps = GpsContext(
+            cache_dir=out / "gps_cache", online_species=online_species
+        )
+        pipeline = TaggingPipeline(
+            ollama=OllamaVision(model=model), gps=gps, use_species_pass=species_pass
+        )
+        log.info(
+            "Tagging ACTIVÉ (modèle passe 1 : %s, passe 2 espèces : %s)",
+            model,
+            "oui" if species_pass else "non",
+        )
+
+    with CatalogReader(lrcat) as cat:
+        records = list(
+            cat.iter_photos(folder_substring=scope, gps_only=gps_only, limit=limit)
+        )
+        log.info("%d photo(s) dans le périmètre.", len(records))
+
+        # Pré-vol : on ne vérifie les volumes des originaux que s'ils sont
+        # réellement dans la cascade (sinon inutile de bloquer).
+        if SourceKind.ORIGINAL in order:
+            orig_paths = [r.original_path for r in records]
+            # non fatal : si le volume des originaux manque, on continue avec
+            # aperçus/smart previews et on le signale UNE seule fois.
+            preflight_volumes(orig_paths, logger=log, fatal=False)
+
+        resolver = ImageResolver(
+            previews_dir=cat.previews_dir,
+            smart_dir=cat.smart_previews_dir,
+            order=order,
+        )
+
+        folder_num = _folder_numbers(records)
+        txt_lines: list[str] = []
+        csv_rows: list[dict] = []
+        by_folder: dict[str, list[str]] = defaultdict(list)
+
+        for rec in records:
+            resolved: ResolvedImage | None = resolver.resolve(rec)
+            num = folder_num[rec.folder_abs]
+            ref = f"{num}/{rec.display_name}"
+
+            if resolved is None:
+                stats.bump("skipped")
+                gps = (
+                    f"{rec.gps_lat:.5f},{rec.gps_lon:.5f}"
+                    if rec.has_gps and rec.gps_lat is not None
+                    else ""
+                )
+                txt_lines.append(f"{ref}  [INDISPONIBLE]")
+                csv_rows.append(
+                    {
+                        "dossier": num,
+                        "fichier": rec.display_name,
+                        "statut": "INDISPONIBLE",
+                        "source": "",
+                        "gps": gps,
+                        "tags": "",
+                    }
+                )
+                continue
+
+            stats.bump("processed")
+            stats.bump(resolved.kind.value)
+            src = _KIND_LABEL[resolved.kind]
+            gps = (
+                f"{rec.gps_lat:.5f},{rec.gps_lon:.5f}"
+                if rec.has_gps and rec.gps_lat is not None
+                else "(pas de GPS)"
+            )
+            # Tags : produits par le pipeline si activé, sinon vide.
+            all_tags: list[str] = []
+            place_tags: list[str] = []
+            llm_tags: list[str] = []
+            species_tags: list[str] = []
+            if pipeline is not None:
+                tr = pipeline.process(rec, resolved)
+                place_tags, llm_tags, species_tags = (
+                    tr.place_tags, tr.llm_tags, tr.species_tags
+                )
+                all_tags = tr.merged()
+
+            detail = (
+                f"{ref}\n      source : {src} ({resolved.image.size[0]}x{resolved.image.size[1]})"
+                f"\n      gps    : {gps}"
+            )
+            if pipeline is not None:
+                detail += (
+                    f"\n      lieu   : {', '.join(place_tags) or '—'}"
+                    f"\n      llm    : {', '.join(llm_tags) or '—'}"
+                    f"\n      espèces: {', '.join(species_tags) or '—'}"
+                )
+            txt_lines.append(detail)
+            by_folder[num].append(rec.display_name)
+            csv_rows.append(
+                {
+                    "dossier": num,
+                    "fichier": rec.display_name,
+                    "statut": "OK",
+                    "source": src,
+                    "gps": gps if gps != "(pas de GPS)" else "",
+                    "tags": ", ".join(all_tags),
+                }
+            )
+
+        resolver.close()
+
+    # --- Écriture des rapports (dans out_dir, jamais dans le catalogue) ---
+    txt_path = out / "rapport_test.txt"
+    csv_path = out / "rapport_test.csv"
+    txt_path.write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(
+            fh, fieldnames=["dossier", "fichier", "statut", "source", "gps", "tags"]
+        )
+        w.writeheader()
+        w.writerows(csv_rows)
+
+    # --- Légende des numéros de dossier ---
+    log.info("Correspondance numéros de dossier :")
+    seen: set[str] = set()
+    for rec in records:
+        num = folder_num[rec.folder_abs]
+        if num not in seen:
+            seen.add(num)
+            log.info("  %s = %s", num, rec.folder_abs)
+
+    for line in stats.summary_lines():
+        log.info(line)
+    log.info("Rapport texte : %s", txt_path)
+    log.info("Rapport CSV   : %s", csv_path)
+
+
+def _parse_order(spec: str) -> tuple[SourceKind, ...]:
+    alias = {
+        "preview": SourceKind.PREVIEW,
+        "previews": SourceKind.PREVIEW,
+        "smart": SourceKind.SMART,
+        "original": SourceKind.ORIGINAL,
+        "originals": SourceKind.ORIGINAL,
+    }
+    out: list[SourceKind] = []
+    for tok in spec.split(","):
+        tok = tok.strip().lower()
+        if tok not in alias:
+            raise argparse.ArgumentTypeError(f"source inconnue : {tok}")
+        out.append(alias[tok])
+    return tuple(out)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Mode test (lecture seule) du Photo Tagger")
+    ap.add_argument("lrcat", help="Chemin du catalogue .lrcat")
+    ap.add_argument("--scope", help="Sous-chaîne de chemin de dossier (périmètre)")
+    ap.add_argument("--limit", type=int, help="Limiter le nombre de photos")
+    ap.add_argument("--gps-only", action="store_true", help="Photos géolocalisées uniquement")
+    ap.add_argument(
+        "--order",
+        type=_parse_order,
+        default=_parse_order("preview,smart,original"),
+        help="Ordre de cascade des sources (def: preview,smart,original)",
+    )
+    ap.add_argument("--out", help="Dossier de sortie des rapports (def: courant)")
+    ap.add_argument("--tag", action="store_true", help="Activer le pipeline de tags (LLM + espèces)")
+    ap.add_argument("--model", default="qwen3-vl:30b", help="Modèle Ollama passe 1")
+    ap.add_argument(
+        "--no-online-species",
+        action="store_true",
+        help="Désactiver le filtrage d'espèces GBIF (online)",
+    )
+    ap.add_argument(
+        "--species",
+        action="store_true",
+        help="Activer la passe 2 BioCLIP (identification d'espèces, expérimental)",
+    )
+    args = ap.parse_args()
+
+    run_test(
+        lrcat=args.lrcat,
+        scope=args.scope,
+        limit=args.limit,
+        gps_only=args.gps_only,
+        order=args.order,
+        out_dir=args.out,
+        tag=args.tag,
+        model=args.model,
+        online_species=not args.no_online_species,
+        species_pass=args.species,
+    )
+
+
+if __name__ == "__main__":
+    main()
