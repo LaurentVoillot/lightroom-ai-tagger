@@ -176,16 +176,18 @@ LrTasks.startAsyncTask(function()
         end
     end
 
-    -- 3) Manifeste. On utilise l'UUID Lightroom (getRawMetadata "uuid") comme id
-    --    stable, et on garde une table localId -> photo pour l'écriture finale.
-    local photoByUuid = {}
+    -- 3) Manifeste. IMPORTANT : on identifie chaque photo par son localIdentifier
+    --    (UNIQUE par copie), et NON par l'uuid d'image — car les copies virtuelles
+    --    et copies empilées partagent le même uuid, ce qui ferait collisionner
+    --    leurs tags. On garde une table id -> photo pour l'écriture finale.
+    local photoById = {}
     local parts = { "{\n", '  "catalog": ' .. jsonValue(catalog:getPath()) .. ",\n", '  "photos": [\n' }
     local n = 0
     for _, photo in ipairs(photos) do
         local jpeg = jpegByLocalId[photo.localIdentifier]
         if jpeg then
             n = n + 1
-            local uuid = photo:getRawMetadata("uuid") or tostring(photo.localIdentifier)
+            local id = tostring(photo.localIdentifier)  -- unique par copie
             local origPath = photo:getRawMetadata("path")
             -- "fileName" n'est PAS une clé raw metadata valide -> on dérive le nom
             -- depuis le chemin (toujours disponible en raw).
@@ -198,10 +200,10 @@ LrTasks.startAsyncTask(function()
             if gps and gps.latitude and gps.longitude then
                 lat, lon, hasGps = gps.latitude, gps.longitude, true
             end
-            photoByUuid[uuid] = photo
+            photoById[id] = photo
             local sep = (n > 1) and ",\n" or ""
             parts[#parts + 1] = sep .. "    {"
-                .. '"id": '      .. jsonValue(uuid) .. ", "
+                .. '"id": '      .. jsonValue(id) .. ", "
                 .. '"file": '    .. jsonValue(jpeg) .. ", "
                 .. '"name": '    .. jsonValue(fileName) .. ", "
                 .. '"folder": '  .. jsonValue(folder) .. ", "
@@ -317,7 +319,7 @@ LrTasks.startAsyncTask(function()
         return
     end
     local rf = io.open(resultsPath, "r"); local rtext = rf:read("*a"); rf:close()
-    local tagsByUuid = parseResults(rtext)
+    local tagsById = parseResults(rtext)
 
     local suffix = opts.suffix or ""
 
@@ -336,8 +338,8 @@ LrTasks.startAsyncTask(function()
 
     local nPhotos, nTags, nSkipped = 0, 0, 0
     catalog:withWriteAccessDo("Ajout des mots-clés IA", function()
-        for uuid, tags in pairs(tagsByUuid) do
-            local photo = photoByUuid[uuid]
+        for id, tags in pairs(tagsById) do
+            local photo = photoById[id]
             if photo then
                 nPhotos = nPhotos + 1
 

@@ -113,16 +113,19 @@ class StandardPreviewSource:
     def load(self, rec: PhotoRecord) -> Image.Image | None:
         if not self.available:
             return None
+        # Les aperçus standard sont indexés par AgLibraryFile.id_global
+        # (= rec.file_uuid), comme les Smart Previews — PAS par Adobe_images.id_global.
+        key = rec.file_uuid
         row = self._pyramid().execute(
-            "SELECT digest FROM Pyramid WHERE uuid = ? LIMIT 1", (rec.uuid,)
+            "SELECT digest FROM Pyramid WHERE uuid = ? LIMIT 1", (key,)
         ).fetchone()
         if not row:
             return None
         digest = row[0]
 
         # Niveaux sur disque : on prend la plus grande dimension disponible.
-        d = self.dir / rec.uuid[0] / rec.uuid[:4]
-        pattern = str(d / f"{rec.uuid}-{digest}_*")
+        d = self.dir / key[0] / key[:4]
+        pattern = str(d / f"{key}-{digest}_*")
         files = glob.glob(pattern)
         if files:
             def _dim(f: str) -> int:
@@ -146,7 +149,7 @@ class StandardPreviewSource:
         if rp is not None:
             r = rp.execute(
                 "SELECT jpegData FROM RootPixels WHERE uuid = ? LIMIT 1",
-                (rec.uuid,),
+                (key,),
             ).fetchone()
             if r and r[0]:
                 try:
