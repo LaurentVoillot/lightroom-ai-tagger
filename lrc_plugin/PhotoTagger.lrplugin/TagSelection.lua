@@ -271,7 +271,11 @@ LrTasks.startAsyncTask(function()
                     if pid then
                         pid = pid:gsub("%s+", "")
                         if pid ~= "" then
+                            -- SIGTERM, puis SIGKILL en repli si le process est
+                            -- bloqué (ex. socket en lecture vers Ollama).
                             LrTasks.execute("/bin/kill " .. pid .. " 2>/dev/null")
+                            LrTasks.sleep(0.5)
+                            LrTasks.execute("/bin/kill -9 " .. pid .. " 2>/dev/null")
                         end
                     end
                 end

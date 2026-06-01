@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import requests
@@ -140,7 +140,11 @@ class GpsContext:
         """Tags de lieu, offline par défaut, online si activé (avec cache)."""
         key = f"{round(lat, 4)},{round(lon, 4)}"
         if key in self._place_cache:
-            return PlaceTags(**self._place_cache[key])
+            # Robuste à un changement de schéma de PlaceTags : on ne garde que
+            # les champs encore connus (un vieux cache ne fait pas planter).
+            cached = self._place_cache[key]
+            valid = {f.name for f in fields(PlaceTags)}
+            return PlaceTags(**{k: v for k, v in cached.items() if k in valid})
 
         tags = self._place_offline(lat, lon)
         if self.online_place:
@@ -214,13 +218,15 @@ class GpsContext:
         if class_key is None:
             return None
         r = self.species_radius_deg
+        # Facette directement sur scientificName : une SEULE requête renvoie les
+        # noms d'espèces (auparavant : 1 requête + 1 lookup par espèce = N+1).
         params = {
             "decimalLatitude": f"{lat - r},{lat + r}",
             "decimalLongitude": f"{lon - r},{lon + r}",
             "taxonKey": class_key,
             "rank": "SPECIES",
             "limit": 0,
-            "facet": "speciesKey",
+            "facet": "scientificName",
             "facetLimit": self.species_limit,
         }
         try:
@@ -233,27 +239,7 @@ class GpsContext:
             if not facets:
                 return []
             counts = facets[0].get("counts", [])
-            names: list[str] = []
-            for c in counts:
-                name = self._gbif_species_name(c["name"])
-                if name:
-                    names.append(name)
-            return names
+            return [c["name"] for c in counts if c.get("name")]
         except Exception as e:
             self.log.info("GBIF indisponible (%s) — pas de filtrage espèces", e)
             return None
-
-    def _gbif_species_name(self, species_key: str) -> str | None:
-        try:
-            resp = requests.get(
-                f"https://api.gbif.org/v1/species/{species_key}",
-                headers={"User-Agent": _USER_AGENT},
-                timeout=10,
-            )
-            if resp.ok:
-                return resp.json().get("scientificName") or resp.json().get(
-                    "canonicalName"
-                )
-        except Exception:
-            pass
-        return None

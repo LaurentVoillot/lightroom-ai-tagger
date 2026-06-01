@@ -81,42 +81,61 @@ def setup_logger(
 ) -> logging.Logger:
     """Configure et renvoie le logger applicatif.
 
-    - Écrit sur la console (stderr).
-    - Écrit dans un fichier `tagger_<horodatage>.log` si `log_dir` est fourni
-      (sinon dans le dossier courant).
-    - Branche un RunStats si fourni.
+    - Écrit sur la console (stderr) : handler ajouté UNE seule fois.
+    - Écrit dans un fichier `tagger_<horodatage>_<pid>.log` (nom unique) : un
+      NOUVEAU fichier à chaque appel, pour que des runs successifs (notamment
+      dans la GUI) n'écrivent pas dans le même fichier.
+    - Branche le RunStats fourni : RE-câblé à chaque appel, sinon le résumé d'un
+      2e run afficherait des zéros.
 
-    Idempotent : un second appel ne duplique pas les handlers.
+    Réentrant : appelable plusieurs fois sans dupliquer le handler console ni
+    empiler des handlers fichier/stats obsolètes.
     """
     logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
 
-    if getattr(logger, "_phototagger_configured", False):
-        return logger
-
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S"
     )
 
-    console = logging.StreamHandler()
-    console.setLevel(level)
-    console.setFormatter(fmt)
-    logger.addHandler(console)
+    # Console : une seule fois (évite la duplication des lignes).
+    if not getattr(logger, "_phototagger_console", False):
+        console = logging.StreamHandler()
+        console.setLevel(level)
+        console.setFormatter(fmt)
+        logger.addHandler(console)
+        logger._phototagger_console = True  # type: ignore[attr-defined]
+
+    # Fichier + stats : on retire les anciens (marqués) avant d'en remettre,
+    # pour repartir proprement à chaque run.
+    for h in list(logger.handlers):
+        if getattr(h, "_phototagger_perrun", False):
+            logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
 
     base = Path(log_dir) if log_dir else Path.cwd()
     base.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logfile = base / f"tagger_{stamp}.log"
+    # Compteur de run (sur le logger) : garantit un nom unique même pour deux
+    # runs dans la même seconde ET le même process (cas de la GUI).
+    run_no = getattr(logger, "_phototagger_run_no", 0) + 1
+    logger._phototagger_run_no = run_no  # type: ignore[attr-defined]
+    logfile = base / f"tagger_{stamp}_{os.getpid()}_{run_no}.log"
     fileh = logging.FileHandler(logfile, encoding="utf-8")
     fileh.setLevel(logging.DEBUG)
     fileh.setFormatter(fmt)
+    fileh._phototagger_perrun = True  # type: ignore[attr-defined]
     logger.addHandler(fileh)
 
     if stats is not None:
-        logger.addHandler(_StatsHandler(stats))
+        sh = _StatsHandler(stats)
+        sh._phototagger_perrun = True  # type: ignore[attr-defined]
+        logger.addHandler(sh)
 
-    logger._phototagger_configured = True  # type: ignore[attr-defined]
     logger._logfile = str(logfile)  # type: ignore[attr-defined]
     logger.info("Journal : %s", logfile)
     return logger

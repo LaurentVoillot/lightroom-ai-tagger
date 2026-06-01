@@ -63,10 +63,21 @@ def run_bench(
         per_model_ntags: dict[str, list[int]] = {m: [] for m in models}
         txt_lines: list[str] = []
 
+        # Réutilise un client par modèle (et non un par photo).
+        clients = {m: OllamaVision(model=m) for m in models}
+
+        # Warm-up : 1er appel = chargement du modèle en VRAM. On le fait hors
+        # mesure pour que les temps reflètent l'inférence seule, pas le chargement.
+        if images:
+            warm_rec, warm_img = images[0]
+            for model in models:
+                log.info("Préchauffage %s…", model)
+                clients[model].analyze(warm_img)
+
         for rec, img in images:
             txt_lines.append(f"\n### {rec.display_name}")
             for model in models:
-                client = OllamaVision(model=model)
+                client = clients[model]
                 t0 = time.time()
                 tags, cats, _ = client.analyze(img)
                 dt = time.time() - t0

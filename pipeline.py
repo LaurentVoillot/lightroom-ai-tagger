@@ -176,8 +176,10 @@ class OllamaVision:
                 self.log.warning("Ollama HTTP %s", r.status_code)
                 return [], [], []
             data = self._extract_json(r.json().get("response", ""))
-            tags = [str(t) for t in data.get("tags", []) if str(t).strip()]
-            cats = [str(c).lower() for c in data.get("categories", [])]
+            # On ne garde que des tags STRING : sous température, le modèle peut
+            # renvoyer un nombre ou un objet, qu'on ne veut pas écrire en mot-clé.
+            tags = [t.strip() for t in data.get("tags", []) if isinstance(t, str) and t.strip()]
+            cats = [str(c).lower() for c in data.get("categories", []) if isinstance(c, str)]
             cats = [c for c in cats if c and c != "none"]
             animals = self._parse_animals(data)
             return tags, cats, animals
