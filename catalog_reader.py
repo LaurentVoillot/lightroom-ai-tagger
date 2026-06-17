@@ -153,17 +153,35 @@ class CatalogReader:
             params = (f"%{folder_substring}%",)
         return self.conn.execute(sql, params).fetchone()[0]
 
+    def selected_image_ids(self) -> list[int]:
+        """Renvoie les id_local de la sélection courante (persistée par Lightroom).
+
+        Lightroom stocke la sélection active dans Adobe_variablesTable sous la clé
+        Adobe_selectedImages (id_local séparés par des virgules). Disponible même
+        Lightroom fermé, tant que le catalogue a été enregistré avec la sélection.
+        """
+        row = self.conn.execute(
+            "SELECT value FROM Adobe_variablesTable WHERE name = 'Adobe_selectedImages'"
+        ).fetchone()
+        if not row or not row[0]:
+            return []
+        import re
+
+        return [int(x) for x in re.findall(r"\d+", str(row[0]))]
+
     def iter_photos(
         self,
         folder_substring: str | None = None,
         gps_only: bool = False,
         limit: int | None = None,
+        image_ids: list[int] | None = None,
     ):
         """Itère les PhotoRecord du catalogue.
 
         - folder_substring : restreint au sous-arbre dont le chemin absolu
           contient cette sous-chaîne (le « périmètre »).
         - gps_only : ne renvoie que les photos géolocalisées.
+        - image_ids : restreint à ces Adobe_images.id_local (ex. sélection courante).
         - limit : limite le nombre de résultats (utile pour les tests).
         """
         sql = self._BASE_QUERY
@@ -174,6 +192,10 @@ class CatalogReader:
             params.append(f"%{folder_substring}%")
         if gps_only:
             where.append("COALESCE(ex.hasGPS, 0) = 1")
+        if image_ids:
+            placeholders = ",".join("?" * len(image_ids))
+            where.append(f"i.id_local IN ({placeholders})")
+            params.extend(image_ids)
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY rf.absolutePath, f.pathFromRoot, fl.baseName"
@@ -182,6 +204,19 @@ class CatalogReader:
 
         for r in self.conn.execute(sql, params):
             yield self._row_to_record(r)
+
+    def existing_keywords(self, image_id: int) -> list[str]:
+        """Mots-clés déjà associés à une image (pour détecter un déjà-taggué)."""
+        cur = self.conn.execute(
+            """
+            SELECT k.name
+            FROM AgLibraryKeyword k
+            JOIN AgLibraryKeywordImage ki ON k.id_local = ki.tag
+            WHERE ki.image = ?
+            """,
+            (image_id,),
+        )
+        return [r[0] for r in cur.fetchall() if r[0]]
 
     def list_folders(self, substring: str | None = None, limit: int = 50):
         """Liste (chemin_absolu, nb_photos) pour aider au choix du périmètre."""

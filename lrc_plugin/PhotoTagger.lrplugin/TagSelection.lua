@@ -83,6 +83,7 @@ local function showOptionsDialog()
         props.onlineSpecies = true
         props.onlinePlace = false
         props.writeXmp = false
+        props.skipTagged = true  -- ignorer les photos déjà taguées IA
         props.suffix = "_AI"  -- suffixe par défaut, modifiable, peut être vide
 
         local c = f:column{
@@ -106,6 +107,7 @@ local function showOptionsDialog()
                 },
                 f:static_text{ title = "(ex. _AI ; laisser vide pour aucun suffixe)" },
             },
+            f:checkbox{ title = "Ignorer les photos déjà taguées par l'IA (même suffixe)", value = LrView.bind("skipTagged") },
             f:checkbox{ title = "Passe 2 espèces (BioCLIP, expérimental)", value = LrView.bind("species") },
             f:checkbox{ title = "Filtrer les espèces par GPS via GBIF (réseau)", value = LrView.bind("onlineSpecies") },
             f:checkbox{ title = "Enrichir les lieux via Nominatim/OSM (réseau)", value = LrView.bind("onlinePlace") },
@@ -124,6 +126,7 @@ local function showOptionsDialog()
             onlineSpecies = props.onlineSpecies,
             onlinePlace = props.onlinePlace,
             writeXmp = props.writeXmp,
+            skipTagged = props.skipTagged,
             suffix = props.suffix or "",
         }
     end)
@@ -139,6 +142,36 @@ LrTasks.startAsyncTask(function()
 
     local opts = showOptionsDialog()
     if not opts then return end  -- annulé
+
+    -- 0) Skip des photos déjà taguées par l'IA : on les retire AVANT l'export,
+    --    pour ne pas exporter ni traiter inutilement (suffixe non vide requis).
+    local nSkippedAlready = 0
+    if opts.skipTagged and opts.suffix ~= "" then
+        local suf = opts.suffix:lower()
+        local kept = {}
+        for _, photo in ipairs(photos) do
+            local hasAI = false
+            for _, kw in ipairs(photo:getRawMetadata("keywords") or {}) do
+                local nm = kw:getName()
+                if nm and nm:lower():sub(-#suf) == suf then
+                    hasAI = true
+                    break
+                end
+            end
+            if hasAI then
+                nSkippedAlready = nSkippedAlready + 1
+            else
+                kept[#kept + 1] = photo
+            end
+        end
+        photos = kept
+        if #photos == 0 then
+            LrDialogs.message("Photo Tagger",
+                "Toutes les photos sélectionnées (" .. nSkippedAlready ..
+                ") sont déjà taguées par l'IA. Rien à faire.", "info")
+            return
+        end
+    end
 
     -- 1) Dossier de travail temporaire.
     local stamp = LrDate.timeToUserFormat(LrDate.currentTime(), "%Y%m%d_%H%M%S")
@@ -376,6 +409,8 @@ LrTasks.startAsyncTask(function()
             .. "ont été taguées.\n\n" or "Mots-clés écrits dans le catalogue.\n")
         .. nPhotos .. " photo(s), " .. nTags .. " mot(s)-clé(s) ajouté(s)"
         .. ((nSkipped > 0) and (", " .. nSkipped .. " ignoré(s) (déjà présents)") or "")
+        .. ((nSkippedAlready > 0) and ("\n" .. nSkippedAlready
+            .. " photo(s) déjà taguée(s) IA, non retraitée(s).") or "")
         .. ".\n\n"
         .. "Rapport : " .. workDir, "info")
 end)

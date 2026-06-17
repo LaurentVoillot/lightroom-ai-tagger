@@ -48,6 +48,10 @@ class RunStats:
             "  via original        : %d" % c.get("src_original", 0),
             "  IGNORÉES (warnings) : %d" % c.get("skipped", 0),
         ]
+        if c.get("skipped_already"):
+            lines.append(
+                "  déjà taguées IA (ignorées) : %d" % c.get("skipped_already", 0)
+            )
         if c.get("xmp_written") or c.get("catalog_written"):
             lines.append(
                 "  tags écrits : %d en .xmp · %d en base"

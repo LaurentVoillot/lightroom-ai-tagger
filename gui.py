@@ -115,14 +115,23 @@ class MainWindow(QWidget):
         g.addWidget(self.catalog_edit, 0, 1)
         g.addWidget(browse, 0, 2)
 
+        # Type de périmètre : sélection courante / tout le catalogue / dossier.
+        self.perimeter_combo = QComboBox()
+        self.perimeter_combo.addItems(
+            ["Dossier / sous-chaîne", "Sélection courante (LrC)", "Tout le catalogue"]
+        )
+        self.perimeter_combo.currentIndexChanged.connect(self._on_perimeter_changed)
+        g.addWidget(QLabel("Traiter :"), 1, 0)
+        g.addWidget(self.perimeter_combo, 1, 1, 1, 2)
+
         self.scope_combo = QComboBox()
         self.scope_combo.setEditable(True)
         self.scope_combo.setMinimumWidth(400)
         load_folders = QPushButton("Lister les dossiers")
         load_folders.clicked.connect(self._load_folders)
-        g.addWidget(QLabel("Périmètre :"), 1, 0)
-        g.addWidget(self.scope_combo, 1, 1)
-        g.addWidget(load_folders, 1, 2)
+        g.addWidget(QLabel("Dossier :"), 2, 0)
+        g.addWidget(self.scope_combo, 2, 1)
+        g.addWidget(load_folders, 2, 2)
         root.addWidget(src)
 
         # --- Options ---
@@ -137,6 +146,10 @@ class MainWindow(QWidget):
 
         self.gps_only = QCheckBox("Photos géolocalisées uniquement")
         og.addWidget(self.gps_only, 0, 2)
+
+        self.skip_tagged_check = QCheckBox("Ignorer les photos déjà taguées par l'IA")
+        self.skip_tagged_check.setChecked(True)
+        og.addWidget(self.skip_tagged_check, 0, 3)
 
         self.order_combo = QComboBox()
         self.order_combo.addItems(
@@ -314,6 +327,10 @@ class MainWindow(QWidget):
             alias[t.strip()] for t in self.order_combo.currentText().split(",")
         )
 
+    def _on_perimeter_changed(self, idx: int) -> None:
+        """Active le champ dossier seulement pour le périmètre « Dossier »."""
+        self.scope_combo.setEnabled(idx == 0)
+
     def _on_test_toggled(self, checked: bool) -> None:
         """Active/désactive les options d'écriture selon le mode test."""
         self.xmp_check.setEnabled(not checked)
@@ -361,9 +378,13 @@ class MainWindow(QWidget):
                 return
 
         limit = self.limit_spin.value() or None
+        # Périmètre : 0 = dossier, 1 = sélection courante, 2 = tout le catalogue.
+        perim = self.perimeter_combo.currentIndex()
+        selected_only = perim == 1
+        scope = self._current_scope() if perim == 0 else None
         params = dict(
             lrcat=lrcat,
-            scope=self._current_scope(),
+            scope=scope,
             limit=limit,
             gps_only=self.gps_only.isChecked(),
             order=self._parse_order(),
@@ -375,6 +396,8 @@ class MainWindow(QWidget):
             write_xmp=write_xmp,
             write_catalog=write_catalog,
             suffix=self.suffix_edit.text(),
+            selected_only=selected_only,
+            skip_tagged=self.skip_tagged_check.isChecked(),
         )
         self.run_btn.setEnabled(False)
         self.status.setText("Traitement en cours…")

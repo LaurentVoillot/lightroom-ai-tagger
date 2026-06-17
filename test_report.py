@@ -66,6 +66,8 @@ def run_test(
     write_xmp: bool = False,
     write_catalog: bool = False,
     suffix: str = "_AI",
+    selected_only: bool = False,
+    skip_tagged: bool = True,
 ) -> None:
     out = Path(out_dir) if out_dir else Path.cwd()
     stats = RunStats()
@@ -115,10 +117,44 @@ def run_test(
             write_catalog = False
 
     with CatalogReader(lrcat) as cat:
+        # Périmètre : sélection courante (persistée par LrC) ou filtre dossier.
+        image_ids = None
+        if selected_only:
+            image_ids = cat.selected_image_ids()
+            log.info("Sélection courante : %d photo(s).", len(image_ids))
+            if not image_ids:
+                log.warning(
+                    "Aucune sélection trouvée dans le catalogue "
+                    "(Adobe_selectedImages vide). Rien à traiter."
+                )
+
         records = list(
-            cat.iter_photos(folder_substring=scope, gps_only=gps_only, limit=limit)
+            cat.iter_photos(
+                folder_substring=scope, gps_only=gps_only, limit=limit,
+                image_ids=image_ids,
+            )
         )
         log.info("%d photo(s) dans le périmètre.", len(records))
+
+        # Skip des photos déjà taguées par l'IA (au moins un mot-clé finissant
+        # par le suffixe). Le suffixe vide désactive ce skip (pas de marqueur).
+        skipped_already = 0
+        if skip_tagged and suffix:
+            suf = suffix.lower()
+            kept = []
+            for rec in records:
+                kws = cat.existing_keywords(rec.image_id)
+                if any(k.lower().endswith(suf) for k in kws):
+                    skipped_already += 1
+                    stats.bump("skipped_already")
+                else:
+                    kept.append(rec)
+            if skipped_already:
+                log.info(
+                    "%d photo(s) déjà taguée(s) IA (suffixe '%s') — ignorée(s).",
+                    skipped_already, suffix,
+                )
+            records = kept
 
         # Pré-vol : on ne vérifie les volumes des originaux que s'ils sont
         # réellement dans la cascade (sinon inutile de bloquer).
@@ -302,6 +338,10 @@ def main() -> None:
     ap.add_argument("--catalog", action="store_true",
                     help="Écrire dans la base LrC, Lightroom fermé (avec --write)")
     ap.add_argument("--suffix", default="_AI", help="Suffixe des tags (def: _AI ; vide possible)")
+    ap.add_argument("--selected", action="store_true",
+                    help="Traiter la sélection courante (persistée par LrC) au lieu d'un dossier")
+    ap.add_argument("--no-skip-tagged", action="store_true",
+                    help="Ne pas ignorer les photos déjà taguées par l'IA (même suffixe)")
     args = ap.parse_args()
 
     run_test(
@@ -319,6 +359,8 @@ def main() -> None:
         write_xmp=args.xmp,
         write_catalog=args.catalog,
         suffix=args.suffix,
+        selected_only=args.selected,
+        skip_tagged=not args.no_skip_tagged,
     )
 
 
