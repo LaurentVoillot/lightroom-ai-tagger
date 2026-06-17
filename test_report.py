@@ -62,11 +62,24 @@ def run_test(
     model: str = "qwen3-vl:30b",
     online_species: bool = True,
     species_pass: bool = False,
+    test_mode: bool = True,
+    write_xmp: bool = False,
+    write_catalog: bool = False,
+    suffix: str = "_AI",
 ) -> None:
     out = Path(out_dir) if out_dir else Path.cwd()
     stats = RunStats()
     log = setup_logger(log_dir=out, stats=stats)
-    log.info("=== MODE TEST (lecture seule, aucune écriture) ===")
+
+    # En MODE TEST, toute écriture est désactivée quoi qu'il arrive.
+    if test_mode:
+        write_xmp = False
+        write_catalog = False
+        log.info("=== MODE TEST (lecture seule, aucune écriture) ===")
+    else:
+        log.info("=== MODE RÉEL — écriture : XMP=%s, catalogue=%s (suffixe '%s') ===",
+                 "oui" if write_xmp else "non",
+                 "oui" if write_catalog else "non", suffix)
 
     # Pipeline de tags (optionnel) : passe 1 LLM + GPS + passe 2 espèces.
     pipeline = None
@@ -85,6 +98,21 @@ def run_test(
             model,
             "oui" if species_pass else "non",
         )
+
+    # Writers d'écriture réelle (hors mode test). Init défensive : si le
+    # catalogue est verrouillé (Lightroom ouvert), on bascule sans planter.
+    xmp_writer = None
+    catalog_writer = None
+    if write_xmp:
+        from writers import XmpWriter
+        xmp_writer = XmpWriter(suffix=suffix)
+    if write_catalog:
+        from writers import CatalogWriter
+        try:
+            catalog_writer = CatalogWriter(lrcat, suffix=suffix)
+        except RuntimeError as e:
+            log.error("Écriture catalogue impossible : %s", e)
+            write_catalog = False
 
     with CatalogReader(lrcat) as cat:
         records = list(
@@ -166,6 +194,21 @@ def run_test(
                     f"\n      llm    : {', '.join(llm_tags) or '—'}"
                     f"\n      espèces: {', '.join(species_tags) or '—'}"
                 )
+
+            # Écriture réelle (hors mode test) : XMP et/ou catalogue, non destructif.
+            if all_tags and xmp_writer is not None:
+                added = xmp_writer.write_tags(
+                    Path(rec.xmp_path), all_tags
+                )
+                if added:
+                    stats.bump("xmp_written", added)
+                detail += f"\n      xmp    : +{added} tag(s)"
+            if all_tags and catalog_writer is not None:
+                added = catalog_writer.add_tags(rec.image_id, all_tags)
+                if added:
+                    stats.bump("catalog_written", added)
+                detail += f"\n      base   : +{added} tag(s)"
+
             txt_lines.append(detail)
             by_folder[num].append(rec.display_name)
             csv_rows.append(
@@ -180,6 +223,9 @@ def run_test(
             )
 
         resolver.close()
+
+    if catalog_writer is not None:
+        catalog_writer.close()
 
     # --- Écriture des rapports (dans out_dir, jamais dans le catalogue) ---
     txt_path = out / "rapport_test.txt"
@@ -249,6 +295,13 @@ def main() -> None:
         action="store_true",
         help="Activer la passe 2 BioCLIP (identification d'espèces, expérimental)",
     )
+    # Écriture réelle (par défaut : mode test, aucune écriture).
+    ap.add_argument("--write", action="store_true",
+                    help="Désactive le mode test et écrit réellement les tags")
+    ap.add_argument("--xmp", action="store_true", help="Écrire des sidecars .xmp (avec --write)")
+    ap.add_argument("--catalog", action="store_true",
+                    help="Écrire dans la base LrC, Lightroom fermé (avec --write)")
+    ap.add_argument("--suffix", default="_AI", help="Suffixe des tags (def: _AI ; vide possible)")
     args = ap.parse_args()
 
     run_test(
@@ -262,6 +315,10 @@ def main() -> None:
         model=args.model,
         online_species=not args.no_online_species,
         species_pass=args.species,
+        test_mode=not args.write,
+        write_xmp=args.xmp,
+        write_catalog=args.catalog,
+        suffix=args.suffix,
     )
 
 

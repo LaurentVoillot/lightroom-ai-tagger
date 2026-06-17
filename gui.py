@@ -170,6 +170,29 @@ class MainWindow(QWidget):
         og.addWidget(self.out_edit, 3, 1, 1, 2)
         root.addWidget(opt)
 
+        # --- Écriture (mode test vs écriture réelle) ---
+        wr = QGroupBox("Écriture")
+        wg = QGridLayout(wr)
+        self.test_check = QCheckBox("Mode test (lecture seule, aucune écriture)")
+        self.test_check.setChecked(True)  # test par défaut, sécurité
+        self.test_check.toggled.connect(self._on_test_toggled)
+        wg.addWidget(self.test_check, 0, 0, 1, 3)
+
+        self.xmp_check = QCheckBox("Créer / compléter les sidecars .xmp")
+        self.catalog_check = QCheckBox("Écrire les mots-clés dans la base LrC (Lightroom fermé)")
+        # désactivés tant que le mode test est coché
+        self.xmp_check.setEnabled(False)
+        self.catalog_check.setEnabled(False)
+        wg.addWidget(self.xmp_check, 1, 0, 1, 3)
+        wg.addWidget(self.catalog_check, 2, 0, 1, 3)
+
+        wg.addWidget(QLabel("Suffixe des tags :"), 3, 0)
+        self.suffix_edit = QLineEdit("_AI")
+        self.suffix_edit.setMaximumWidth(120)
+        wg.addWidget(self.suffix_edit, 3, 1)
+        wg.addWidget(QLabel("(vide = aucun suffixe ; non destructif)"), 3, 2)
+        root.addWidget(wr)
+
         # --- Actions ---
         actions = QHBoxLayout()
         self.run_btn = QPushButton("Lancer le mode test")
@@ -291,11 +314,52 @@ class MainWindow(QWidget):
             alias[t.strip()] for t in self.order_combo.currentText().split(",")
         )
 
+    def _on_test_toggled(self, checked: bool) -> None:
+        """Active/désactive les options d'écriture selon le mode test."""
+        self.xmp_check.setEnabled(not checked)
+        self.catalog_check.setEnabled(not checked)
+        self.suffix_edit.setEnabled(not checked)
+        self.run_btn.setText("Lancer le mode test" if checked else "Lancer le taggage")
+
     def _run(self) -> None:
         lrcat = self.catalog_edit.text().strip()
         if not lrcat or not Path(lrcat).is_file():
             self.status.setText("Choisis d'abord un catalogue valide.")
             return
+
+        test_mode = self.test_check.isChecked()
+        write_xmp = (not test_mode) and self.xmp_check.isChecked()
+        write_catalog = (not test_mode) and self.catalog_check.isChecked()
+
+        # Garde-fou : écriture base seulement si Lightroom est fermé.
+        if write_catalog:
+            from writers import catalog_is_locked
+
+            if catalog_is_locked(lrcat):
+                self.status.setText(
+                    "⚠ Catalogue verrouillé : ferme Lightroom pour écrire dans la base."
+                )
+                return
+
+        # Confirmation avant toute écriture réelle.
+        if write_xmp or write_catalog:
+            cibles = []
+            if write_xmp:
+                cibles.append("sidecars .xmp")
+            if write_catalog:
+                cibles.append("base Lightroom")
+            from PyQt6.QtWidgets import QMessageBox
+
+            resp = QMessageBox.question(
+                self,
+                "Confirmer l'écriture",
+                "Écriture RÉELLE (non destructive) dans : "
+                + " + ".join(cibles)
+                + f"\nSuffixe : « {self.suffix_edit.text()} ».\n\nContinuer ?",
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+
         limit = self.limit_spin.value() or None
         params = dict(
             lrcat=lrcat,
@@ -307,6 +371,10 @@ class MainWindow(QWidget):
             tag=self.tag_check.isChecked(),
             model=self.model_combo.currentText().strip(),
             species_pass=self.species_check.isChecked(),
+            test_mode=test_mode,
+            write_xmp=write_xmp,
+            write_catalog=write_catalog,
+            suffix=self.suffix_edit.text(),
         )
         self.run_btn.setEnabled(False)
         self.status.setText("Traitement en cours…")

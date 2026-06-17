@@ -41,15 +41,22 @@ class RunStats:
 
     def summary_lines(self) -> list[str]:
         c = self.counter
-        return [
+        lines = [
             "=== Terminé : %d photos traitées ===" % c.get("processed", 0),
             "  via aperçu standard : %d" % c.get("src_preview", 0),
             "  via Smart Preview   : %d" % c.get("src_smart", 0),
             "  via original        : %d" % c.get("src_original", 0),
             "  IGNORÉES (warnings) : %d" % c.get("skipped", 0),
-            "  warnings: %d · erreurs: %d"
-            % (c.get("warning", 0), c.get("error", 0)),
         ]
+        if c.get("xmp_written") or c.get("catalog_written"):
+            lines.append(
+                "  tags écrits : %d en .xmp · %d en base"
+                % (c.get("xmp_written", 0), c.get("catalog_written", 0))
+            )
+        lines.append(
+            "  warnings: %d · erreurs: %d" % (c.get("warning", 0), c.get("error", 0))
+        )
+        return lines
 
 
 # ---------------------------------------------------------------------------
