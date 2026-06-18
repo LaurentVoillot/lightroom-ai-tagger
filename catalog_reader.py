@@ -186,6 +186,7 @@ class CatalogReader:
         gps_only: bool = False,
         limit: int | None = None,
         image_ids: list[int] | None = None,
+        with_smart_preview_only: bool = False,
     ):
         """Itère les PhotoRecord du catalogue.
 
@@ -193,6 +194,10 @@ class CatalogReader:
           contient cette sous-chaîne (le « périmètre »).
         - gps_only : ne renvoie que les photos géolocalisées.
         - image_ids : restreint à ces Adobe_images.id_local (ex. sélection courante).
+        - with_smart_preview_only : ne renvoie que les photos ayant réellement un
+          Smart Preview (présentes dans AgDNGProxyInfo). Évite de traiter en
+          priorité des photos cloud (Mobile Downloads) dont les pixels ne sont
+          pas sur le disque et qui, par tri alphabétique, passent en tête.
         - limit : limite le nombre de résultats (utile pour les tests).
         """
         sql = self._BASE_QUERY
@@ -207,6 +212,10 @@ class CatalogReader:
             placeholders = ",".join("?" * len(image_ids))
             where.append(f"i.id_local IN ({placeholders})")
             params.extend(image_ids)
+        if with_smart_preview_only:
+            where.append(
+                "fl.id_global IN (SELECT fileUUID FROM AgDNGProxyInfo)"
+            )
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY rf.absolutePath, f.pathFromRoot, fl.baseName"

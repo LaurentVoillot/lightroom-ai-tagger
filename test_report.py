@@ -135,10 +135,15 @@ def run_test(
                     "(Adobe_selectedImages vide). Rien à traiter."
                 )
 
+        # Par défaut, on ne traite que les photos ayant un VRAI Smart Preview
+        # (présentes dans AgDNGProxyInfo) — sauf si on cible une sélection
+        # explicite. Évite que les photos cloud (Mobile Downloads, sans pixels
+        # sur disque), placées en tête par le tri, saturent la limite.
+        sp_only = not selected_only
         records = list(
             cat.iter_photos(
                 folder_substring=scope, gps_only=gps_only, limit=limit,
-                image_ids=image_ids,
+                image_ids=image_ids, with_smart_preview_only=sp_only,
             )
         )
         log.info("%d photo(s) dans le périmètre.", len(records))
