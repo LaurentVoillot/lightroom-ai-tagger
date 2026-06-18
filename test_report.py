@@ -76,6 +76,15 @@ def run_test(
     stats = RunStats()
     log = setup_logger(log_dir=out, stats=stats)
 
+    # Garde-fou : le catalogue doit être accessible (volume monté). Évite le
+    # cryptique « database disk image is malformed » si le disque est démonté.
+    if not Path(lrcat).is_file():
+        log.error(
+            "Catalogue inaccessible : %s. Le volume est-il bien monté "
+            "(ex. /Volumes/X10) ? Rebranche le disque puis relance.", lrcat,
+        )
+        return
+
     # En MODE TEST, toute écriture est désactivée quoi qu'il arrive.
     if test_mode:
         write_xmp = False
@@ -190,7 +199,13 @@ def run_test(
             orig_paths = [r.original_path for r in records]
             # non fatal : si le volume des originaux manque, on continue avec
             # aperçus/smart previews et on le signale UNE seule fois.
-            preflight_volumes(orig_paths, logger=log, fatal=False)
+            missing = preflight_volumes(orig_paths, logger=log, fatal=False)
+            if missing:
+                log.info(
+                    "→ Ce n'est pas bloquant : les originaux sur ces volumes "
+                    "sont ignorés, les aperçus/Smart Previews (sur le volume du "
+                    "catalogue) prennent le relais."
+                )
 
         resolver = ImageResolver(
             previews_dir=cat.previews_dir,

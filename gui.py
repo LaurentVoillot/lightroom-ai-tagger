@@ -83,11 +83,21 @@ class Worker(QObject):
         # Import tardif : évite de charger torch/ollama tant qu'on ne lance rien.
         from test_report import run_test
 
+        log = logging.getLogger(LOGGER_NAME)
         try:
             run_test(progress_cb=lambda d, t, n: self.progress.emit(d, t, n),
                      **self.params)
         except Exception as e:  # on ne laisse jamais l'UI planter
-            logging.getLogger(LOGGER_NAME).error("Échec du traitement : %s", e)
+            msg = str(e)
+            if "malformed" in msg or "disk I/O" in msg or "not a database" in msg:
+                log.error(
+                    "Échec : le catalogue est devenu illisible. Le volume du "
+                    "catalogue (ex. /Volumes/X10) s'est probablement DÉCONNECTÉ "
+                    "en cours de lecture. Vérifie que le disque est bien monté, "
+                    "puis relance. (%s)", msg,
+                )
+            else:
+                log.error("Échec du traitement : %s", msg)
         finally:
             self.finished.emit()
 
