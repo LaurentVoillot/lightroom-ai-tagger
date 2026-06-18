@@ -40,6 +40,15 @@ _KIND_LABEL = {
 }
 
 
+def _flush_log(log) -> None:
+    """Force l'écriture disque des handlers (progression visible en direct)."""
+    for h in log.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+
 def _folder_numbers(records: list[PhotoRecord]) -> dict[str, str]:
     """Attribue un numéro stable à chaque dossier rencontré (0001, 0002, ...)."""
     mapping: dict[str, str] = {}
@@ -220,9 +229,14 @@ def run_test(
         by_folder: dict[str, list[str]] = defaultdict(list)
 
         total_records = len(records)
+        log.info("Début du traitement de %d photo(s)…", total_records)
         for idx, rec in enumerate(records, 1):
             if progress_cb is not None:
                 progress_cb(idx, total_records, rec.display_name)
+            # Log de progression visible (toutes les photos) + flush, pour suivre
+            # un gros run en direct dans le fichier log.
+            log.info("[%d/%d] %s", idx, total_records, rec.display_name)
+            _flush_log(log)
             resolved: ResolvedImage | None = resolver.resolve(rec)
             num = folder_num[rec.folder_abs]
             ref = f"{num}/{rec.display_name}"
@@ -287,18 +301,24 @@ def run_test(
                     stats.bump("xmp_written", added)
                 detail += f"\n      xmp    : +{added} tag(s)"
             if write_tags and catalog_writer is not None:
-                # commit=False : écriture par lots, commit groupé tous les 50.
+                # commit=False : écriture par lots, commit groupé tous les 10.
                 added = catalog_writer.add_tags(rec.image_id, write_tags, commit=False)
                 if added:
                     stats.bump("catalog_written", added)
                 detail += f"\n      base   : +{added} tag(s)"
-                if idx % 50 == 0:
+                if idx % 10 == 0:
                     catalog_writer.commit_batch()
 
-            # Mémorise la photo comme traitée (reprise de session), commit groupé.
+            # Mémorise la photo comme traitée (reprise de session), commit tous
+            # les 10 — assez fréquent pour une reprise fiable après un arrêt.
             if session is not None:
                 session.mark(rec.file_uuid, rec.display_name, len(all_tags),
-                             commit=(idx % 50 == 0))
+                             commit=(idx % 10 == 0))
+
+            # Log du résultat de la photo + flush, pour suivre en direct.
+            log.info("    → %d tag(s)%s", len(all_tags),
+                     "" if all_tags else " (aucun)")
+            _flush_log(log)
 
             txt_lines.append(detail)
             by_folder[num].append(rec.display_name)
