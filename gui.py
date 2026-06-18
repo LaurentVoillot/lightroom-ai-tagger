@@ -511,11 +511,17 @@ class MainWindow(QWidget):
 def main() -> None:
     app = QApplication(sys.argv)
     win = MainWindow()
-    # Pré-remplit : dernier catalogue valide mémorisé, sinon le défaut X10.
+    # Pré-remplit : catalogue par défaut, sinon dernier valide mémorisé.
+    # Le défaut est priorisé pour ne jamais retomber sur le catalogue cloud.
+    default_cat = "/Volumes/X10/LR-v15 copie/LR-v15.lrcat"
     last = win._settings.value("last_catalog", "")
-    default_cat = "/Volumes/X10/LR-v15/LR-v15.lrcat"
-    chosen = last if last and Path(last).is_file() else default_cat
-    if Path(chosen).is_file():
+    if Path(default_cat).is_file():
+        chosen = default_cat
+    elif last and Path(last).is_file():
+        chosen = last
+    else:
+        chosen = ""
+    if chosen and Path(chosen).is_file():
         win.catalog_edit.setText(chosen)
         win._on_catalog_changed()  # affiche le diagnostic au démarrage
     win.show()
