@@ -99,6 +99,12 @@ class CatalogReader:
             self.lrcat_path.stem + " Smart Previews.lrdata"
         )
 
+    @property
+    def cloud_smart_previews_dir(self) -> Path:
+        """Smart Previews CLOUD (catalogue mobile) : Mobile Downloads.lrdata/
+        downloaded-smart-previews/ (fichiers nommés d'après le nom original)."""
+        return self.lrcat_path.with_name("Mobile Downloads.lrdata") / "downloaded-smart-previews"
+
     # -- Requêtes ----------------------------------------------------------
 
     _BASE_QUERY = """

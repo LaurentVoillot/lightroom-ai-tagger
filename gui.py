@@ -405,14 +405,23 @@ class MainWindow(QWidget):
             self.status.setText("Choisis d'abord un catalogue valide.")
             return
 
-        # Garde-fou : refuse de lancer sur un catalogue inadapté (cloud/mobile).
+        # Avertissement NON bloquant : si le catalogue semble inadapté
+        # (cloud/mobile), on prévient mais on laisse l'utilisateur confirmer —
+        # certains catalogues cloud sont volontairement traités.
         ok, msg = self._diagnose_catalog(lrcat)
         if not ok:
             from PyQt6.QtWidgets import QMessageBox
 
-            QMessageBox.warning(self, "Catalogue inadapté", msg)
-            self.status.setText(msg)
-            return
+            resp = QMessageBox.question(
+                self,
+                "Catalogue inhabituel",
+                msg + "\n\nLancer quand même ?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                self.status.setText(msg)
+                return
 
         test_mode = self.test_check.isChecked()
         write_xmp = (not test_mode) and self.xmp_check.isChecked()

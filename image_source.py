@@ -176,15 +176,26 @@ class SmartPreviewSource:
     (+ imagecodecs pour JPEG XL) en prenant la série de plus grande surface.
     """
 
-    def __init__(self, smart_dir: Path):
+    def __init__(self, smart_dir: Path, cloud_dir: Path | None = None):
         self.dir = Path(smart_dir)
+        # Dossier des Smart Previews CLOUD (catalogue mobile) : fichiers nommés
+        # d'après le nom de fichier ORIGINAL (ex. _DSC6955.NEF), à plat, dans
+        # Mobile Downloads.lrdata/downloaded-smart-previews/. Fallback optionnel.
+        self.cloud_dir = Path(cloud_dir) if cloud_dir else None
 
     @property
     def available(self) -> bool:
-        return self.dir.is_dir()
+        return self.dir.is_dir() or (self.cloud_dir is not None and self.cloud_dir.is_dir())
 
     def _dng_path(self, file_uuid: str) -> Path:
         return self.dir / file_uuid[0] / file_uuid[:4] / f"{file_uuid}.dng"
+
+    def _cloud_path(self, rec: PhotoRecord) -> Path | None:
+        """Smart Preview cloud : fichier nommé d'après le nom original."""
+        if self.cloud_dir is None or not self.cloud_dir.is_dir():
+            return None
+        cand = self.cloud_dir / rec.display_name
+        return cand if cand.is_file() else None
 
     @staticmethod
     def _decode_dng(path: str) -> Image.Image | None:
@@ -206,13 +217,14 @@ class SmartPreviewSource:
     def load(self, rec: PhotoRecord) -> Image.Image | None:
         if not self.available:
             return None
-        # Le .dng Smart Preview est nommé d'après AgLibraryFile.id_global,
-        # PAS d'après l'UUID de l'image (Adobe_images.id_global).
+        # 1) Smart Preview desktop : .dng nommé d'après AgLibraryFile.id_global
+        #    (file_uuid), PAS d'après l'UUID image. 2) sinon Smart Preview cloud.
         p = self._dng_path(rec.file_uuid)
-        if not p.is_file():
+        path = p if p.is_file() else self._cloud_path(rec)
+        if path is None:
             return None
         try:
-            im = self._decode_dng(str(p))
+            im = self._decode_dng(str(path))
             if im is not None:
                 im.thumbnail((2048, 2048))
                 return im
@@ -251,10 +263,11 @@ class ImageResolver:
         previews_dir: Path,
         smart_dir: Path,
         order: tuple[SourceKind, ...] = DEFAULT_ORDER,
+        cloud_smart_dir: Path | None = None,
     ):
         self.order = order
         self._standard = StandardPreviewSource(previews_dir)
-        self._smart = SmartPreviewSource(smart_dir)
+        self._smart = SmartPreviewSource(smart_dir, cloud_dir=cloud_smart_dir)
         self._original = OriginalFileSource()
         self.log = get_logger()
 

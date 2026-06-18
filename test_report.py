@@ -191,6 +191,7 @@ def run_test(
             previews_dir=cat.previews_dir,
             smart_dir=cat.smart_previews_dir,
             order=order,
+            cloud_smart_dir=cat.cloud_smart_previews_dir,
         )
 
         folder_num = _folder_numbers(records)
