@@ -99,7 +99,12 @@ class MainWindow(QWidget):
         self.resize(900, 700)
         self._thread: QThread | None = None
         self._counts = {"info": 0, "warning": 0, "error": 0}
+        from PyQt6.QtCore import QSettings
+
+        self._settings = QSettings("phototagger", "lightroom-ai-tagger")
         self._build_ui()
+        # Vérifie le catalogue chaque fois que le champ est édité.
+        self.catalog_edit.editingFinished.connect(self._on_catalog_changed)
         self._setup_logging()
 
     # -- Construction de l'interface ---------------------------------------
@@ -299,12 +304,50 @@ class MainWindow(QWidget):
 
     # -- Actions -----------------------------------------------------------
 
+    @staticmethod
+    def _diagnose_catalog(lrcat: str) -> tuple[bool, str]:
+        """Évalue un catalogue. Renvoie (utilisable, message).
+
+        Un catalogue est jugé inadapté s'il n'a pas de dossier Smart Previews à
+        côté ET très peu de photos (cas typique du catalogue cloud/mobile par
+        défaut, ~/Pictures/Lightroom/Lightroom Catalog.lrcat).
+        """
+        p = Path(lrcat)
+        if not p.is_file():
+            return False, "Catalogue introuvable."
+        smart = p.with_name(p.stem + " Smart Previews.lrdata")
+        try:
+            with CatalogReader(lrcat) as cat:
+                n = cat.count_in_scope()
+        except Exception as e:
+            return False, f"Lecture impossible : {e}"
+        has_smart = smart.is_dir()
+        if not has_smart and n < 100:
+            return False, (
+                f"⚠ Catalogue inadapté : {n} photo(s), aucun dossier Smart "
+                f"Previews. C'est probablement le catalogue cloud/mobile par "
+                f"défaut. Choisis ton catalogue principal (ex. sur /Volumes)."
+            )
+        warn = "" if has_smart else " (pas de Smart Previews — sera lent)"
+        return True, f"Catalogue OK : {n} photo(s){warn}."
+
+    def _on_catalog_changed(self) -> None:
+        """Vérifie le catalogue dès qu'il change, et mémorise s'il est valide."""
+        lrcat = self.catalog_edit.text().strip()
+        if not lrcat:
+            return
+        ok, msg = self._diagnose_catalog(lrcat)
+        self.status.setText(msg)
+        if ok:
+            self._settings.setValue("last_catalog", lrcat)
+
     def _browse_catalog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Choisir un catalogue", "", "Catalogues Lightroom (*.lrcat)"
         )
         if path:
             self.catalog_edit.setText(path)
+            self._on_catalog_changed()
 
     def _load_folders(self) -> None:
         lrcat = self.catalog_edit.text().strip()
@@ -360,6 +403,15 @@ class MainWindow(QWidget):
         lrcat = self.catalog_edit.text().strip()
         if not lrcat or not Path(lrcat).is_file():
             self.status.setText("Choisis d'abord un catalogue valide.")
+            return
+
+        # Garde-fou : refuse de lancer sur un catalogue inadapté (cloud/mobile).
+        ok, msg = self._diagnose_catalog(lrcat)
+        if not ok:
+            from PyQt6.QtWidgets import QMessageBox
+
+            QMessageBox.warning(self, "Catalogue inadapté", msg)
+            self.status.setText(msg)
             return
 
         test_mode = self.test_check.isChecked()
@@ -450,10 +502,13 @@ class MainWindow(QWidget):
 def main() -> None:
     app = QApplication(sys.argv)
     win = MainWindow()
-    # Pré-remplit avec le catalogue de test s'il existe.
+    # Pré-remplit : dernier catalogue valide mémorisé, sinon le défaut X10.
+    last = win._settings.value("last_catalog", "")
     default_cat = "/Volumes/X10/LR-v15/LR-v15.lrcat"
-    if Path(default_cat).is_file():
-        win.catalog_edit.setText(default_cat)
+    chosen = last if last and Path(last).is_file() else default_cat
+    if Path(chosen).is_file():
+        win.catalog_edit.setText(chosen)
+        win._on_catalog_changed()  # affiche le diagnostic au démarrage
     win.show()
     sys.exit(app.exec())
 
