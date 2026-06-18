@@ -154,6 +154,9 @@ class MainWindow(QWidget):
         self.skip_tagged_check.setChecked(True)
         og.addWidget(self.skip_tagged_check, 0, 3)
 
+        self.resume_check = QCheckBox("Reprendre (ignorer les photos déjà traitées)")
+        og.addWidget(self.resume_check, 4, 0, 1, 2)
+
         self.order_combo = QComboBox()
         self.order_combo.addItems(
             [
@@ -414,6 +417,7 @@ class MainWindow(QWidget):
             selected_only=selected_only,
             skip_tagged=self.skip_tagged_check.isChecked(),
             hierarchical=(not test_mode) and self.hier_check.isChecked(),
+            resume=self.resume_check.isChecked(),
         )
         self.run_btn.setEnabled(False)
         self.status.setText("Traitement en cours…")

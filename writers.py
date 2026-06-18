@@ -354,12 +354,16 @@ class CatalogWriter:
             leaf_id = res[0]
         return leaf_id
 
-    def add_tags(self, image_id: int, ai_tags) -> int:
+    def add_tags(self, image_id: int, ai_tags, commit: bool = True) -> int:
         """Ajoute des tags à une image, sans doublon. Renvoie le nb ajouté.
 
         ai_tags : liste où chaque élément est soit une string (tag plat), soit
         une liste de niveaux (chemin hiérarchique, ex. ['Lieu','France','Isère']).
         Une string contenant '>' est aussi traitée comme un chemin.
+
+        commit : si False, n'effectue PAS de commit (écriture par lots — voir
+        commit_batch()). Permet de regrouper N images dans une seule transaction
+        pour de bien meilleures performances sur de gros volumes.
         """
         if not ai_tags:
             return 0
@@ -368,7 +372,6 @@ class CatalogWriter:
         cur = self.conn.cursor()
         added = 0
         try:
-            cur.execute("BEGIN")
             for tag in ai_tags:
                 path = _as_path(tag)
                 leaf = path[-1]
@@ -390,9 +393,18 @@ class CatalogWriter:
                 )
                 seen.add(bare_tag(f"{leaf}{self.suffix}", self.suffix))
                 added += 1
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
         except sqlite3.Error as e:
             self.conn.rollback()
             self.log.error("Écriture catalogue échouée (image %s) : %s", image_id, e)
             return 0
         return added
+
+    def commit_batch(self) -> None:
+        """Valide une série d'add_tags(commit=False). À appeler en fin de lot."""
+        try:
+            self.conn.commit()
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            self.log.error("Commit du lot catalogue échoué : %s", e)

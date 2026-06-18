@@ -69,6 +69,7 @@ def run_test(
     selected_only: bool = False,
     skip_tagged: bool = True,
     hierarchical: bool = False,
+    resume: bool = False,
     progress_cb=None,
 ) -> None:
     out = Path(out_dir) if out_dir else Path.cwd()
@@ -118,6 +119,8 @@ def run_test(
             log.error("Écriture catalogue impossible : %s", e)
             write_catalog = False
 
+    session = None  # session de reprise (initialisée dans le with si resume)
+
     # Si on écrit dans le catalogue, le reader doit voir les écritures du writer
     # -> pas de mode immutable (B2 : éviter reader figé + writer RW concurrent).
     with CatalogReader(lrcat, immutable=not write_catalog) as cat:
@@ -159,6 +162,22 @@ def run_test(
                     skipped_already, suffix,
                 )
             records = kept
+
+        # Reprise de session : ignore les photos déjà traitées par CE pipeline
+        # (mémorisées dans out_dir/session.db). Permet de reprendre un gros run.
+        if resume:
+            from session_cache import SessionCache
+
+            session = SessionCache(out / "session.db")
+            before = len(records)
+            records = [r for r in records if not session.is_done(r.file_uuid)]
+            resumed = before - len(records)
+            if resumed:
+                log.info(
+                    "Reprise : %d photo(s) déjà traitée(s) dans une session "
+                    "précédente — ignorée(s) (%d déjà en base).",
+                    resumed, session.count(),
+                )
 
         # Pré-vol : on ne vérifie les volumes des originaux que s'ils sont
         # réellement dans la cascade (sinon inutile de bloquer).
@@ -247,10 +266,18 @@ def run_test(
                     stats.bump("xmp_written", added)
                 detail += f"\n      xmp    : +{added} tag(s)"
             if write_tags and catalog_writer is not None:
-                added = catalog_writer.add_tags(rec.image_id, write_tags)
+                # commit=False : écriture par lots, commit groupé tous les 50.
+                added = catalog_writer.add_tags(rec.image_id, write_tags, commit=False)
                 if added:
                     stats.bump("catalog_written", added)
                 detail += f"\n      base   : +{added} tag(s)"
+                if idx % 50 == 0:
+                    catalog_writer.commit_batch()
+
+            # Mémorise la photo comme traitée (reprise de session), commit groupé.
+            if session is not None:
+                session.mark(rec.file_uuid, rec.display_name, len(all_tags),
+                             commit=(idx % 50 == 0))
 
             txt_lines.append(detail)
             by_folder[num].append(rec.display_name)
@@ -268,7 +295,10 @@ def run_test(
         resolver.close()
 
     if catalog_writer is not None:
+        catalog_writer.commit_batch()  # valide le dernier lot (< 50)
         catalog_writer.close()
+    if session is not None:
+        session.close()  # commit final de la session de reprise
     if pipeline is not None and pipeline.gps is not None:
         pipeline.gps.flush()  # B3 : écrit les caches GPS accumulés
 
@@ -366,6 +396,8 @@ def main() -> None:
                     help="Ne pas ignorer les photos déjà taguées par l'IA (même suffixe)")
     ap.add_argument("--hierarchical", action="store_true",
                     help="Écrire des mots-clés hiérarchiques (lieu, espèces) au lieu de plats")
+    ap.add_argument("--resume", action="store_true",
+                    help="Reprendre : ignorer les photos déjà traitées (out/session.db)")
     args = ap.parse_args()
 
     run_test(
@@ -386,6 +418,7 @@ def main() -> None:
         selected_only=args.selected,
         skip_tagged=not args.no_skip_tagged,
         hierarchical=args.hierarchical,
+        resume=args.resume,
     )
 
 
