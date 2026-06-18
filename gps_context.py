@@ -44,6 +44,17 @@ _NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 _GBIF_URL = "https://api.gbif.org/v1/occurrence/search"
 _USER_AGENT = "photo-tagger/0.1 (local Lightroom tagging)"
 
+# Noms français des classes taxonomiques (pour la hiérarchie de tags d'espèces).
+_CLASS_FR = {
+    "Aves": "Oiseaux",
+    "Insecta": "Insectes",
+    "Mammalia": "Mammifères",
+    "Reptilia": "Reptiles",
+    "Amphibia": "Amphibiens",
+    "Arachnida": "Arachnides",
+    "Actinopterygii": "Poissons",
+}
+
 
 @dataclass
 class PlaceTags:
@@ -65,6 +76,19 @@ class PlaceTags:
                 seen.add(v)
                 out.append(v)
         return out
+
+    def as_hierarchy(self, root: str = "Lieu") -> list[str] | None:
+        """Chemin hiérarchique du lieu : ['Lieu', pays, région, dépt, ville, poi].
+
+        Renvoie None si aucune donnée de lieu. Les niveaux vides ou identiques au
+        précédent sont sautés (reverse_geocoder répète parfois admin2 == ville),
+        en conservant l'ordre géographique (du plus large au plus précis).
+        """
+        levels = [root]
+        for v in (self.country, self.admin1, self.admin2, self.city, self.poi):
+            if v and v.strip() and v.strip().lower() != levels[-1].strip().lower():
+                levels.append(v.strip())
+        return levels if len(levels) > 1 else None
 
 
 @dataclass
@@ -100,11 +124,19 @@ class GpsContext:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._place_cache_path = self.cache_dir / "place_cache.json"
         self._species_cache_path = self.cache_dir / "species_cache.json"
+        self._taxo_cache_path = self.cache_dir / "taxo_cache.json"
         self._place_cache = self._load_json(self._place_cache_path)
         self._species_cache = self._load_json(self._species_cache_path)
+        self._taxo_cache = self._load_json(self._taxo_cache_path)
 
         self._rg = None  # reverse_geocoder, chargé paresseusement
         self._last_nominatim = 0.0
+
+        # B3 : écriture des caches DIFFÉRÉE (au lieu de réécrire tout le JSON à
+        # chaque photo). On marque « sale » et on flush périodiquement + en fin.
+        self._dirty: set[str] = set()
+        self._writes_since_flush = 0
+        self._flush_every = 50
 
     # -- utilitaires cache --------------------------------------------------
 
@@ -122,6 +154,35 @@ class GpsContext:
             path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             self.log.warning("Échec écriture cache %s (%s)", path.name, e)
+
+    def _mark_dirty(self, which: str) -> None:
+        """Marque un cache modifié ; flush par lots pour limiter les écritures disque."""
+        self._dirty.add(which)
+        self._writes_since_flush += 1
+        if self._writes_since_flush >= self._flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        """Écrit sur disque les caches modifiés depuis le dernier flush."""
+        targets = {
+            "place": (self._place_cache_path, self._place_cache),
+            "species": (self._species_cache_path, self._species_cache),
+            "taxo": (self._taxo_cache_path, self._taxo_cache),
+        }
+        for which in list(self._dirty):
+            path, data = targets[which]
+            self._save_json(path, data)
+        self._dirty.clear()
+        self._writes_since_flush = 0
+
+    def close(self) -> None:
+        self.flush()
+
+    def __enter__(self) -> "GpsContext":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.flush()
 
     def _cell_key(self, lat: float, lon: float) -> str:
         g = self.grid_deg
@@ -153,7 +214,7 @@ class GpsContext:
                 tags.poi = poi
 
         self._place_cache[key] = tags.__dict__
-        self._save_json(self._place_cache_path, self._place_cache)
+        self._mark_dirty("place")
         return tags
 
     def _place_offline(self, lat: float, lon: float) -> PlaceTags:
@@ -192,6 +253,44 @@ class GpsContext:
             self.log.info("Nominatim indisponible (%s) — tags lieu offline seuls", e)
         return None
 
+    # -- taxonomie (GBIF) pour tags hiérarchiques d'espèces -----------------
+
+    def species_hierarchy(self, scientific_name: str, root: str = "Faune") -> list[str]:
+        """Chemin taxonomique d'une espèce : [root, classe_fr, famille, espèce].
+
+        Ex. 'Alcedo atthis' -> ['Faune', 'Oiseaux', 'Alcedinidae', 'Alcedo atthis'].
+        Renvoie au minimum [root, nom] si la taxonomie est indisponible. Caché.
+        """
+        key = scientific_name.strip()
+        if not key:
+            return [root]
+        if key in self._taxo_cache:
+            return self._taxo_cache[key]
+        path = [root]
+        try:
+            r = requests.get(
+                "https://api.gbif.org/v1/species/match",
+                params={"name": key}, headers={"User-Agent": _USER_AGENT}, timeout=10,
+            )
+            if r.ok:
+                d = r.json()
+                cls = _CLASS_FR.get(d.get("class", ""), d.get("class"))
+                if cls:
+                    path.append(cls)
+                if d.get("family"):
+                    path.append(d["family"])
+                path.append(d.get("species") or key)
+            else:
+                path.append(key)
+        except Exception as e:
+            self.log.info("Taxonomie GBIF indisponible (%s) — tag espèce plat", e)
+            path.append(key)
+        if len(path) == 1:
+            path.append(key)
+        self._taxo_cache[key] = path
+        self._mark_dirty("taxo")
+        return path
+
     # -- espèces (GBIF) -----------------------------------------------------
 
     def species_for(self, lat: float, lon: float, group: str) -> list[str] | None:
@@ -210,7 +309,7 @@ class GpsContext:
         species = self._gbif_species(lat, lon, group)
         if species is not None:
             self._species_cache[cell][group] = species
-            self._save_json(self._species_cache_path, self._species_cache)
+            self._mark_dirty("species")
         return species
 
     def _gbif_species(self, lat: float, lon: float, group: str) -> list[str] | None:

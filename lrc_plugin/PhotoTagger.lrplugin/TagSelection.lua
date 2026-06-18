@@ -49,21 +49,30 @@ local function jsonValue(v)
 end
 
 -- ---- JSON minimal (lecture de results.json) ----
--- Parse le sous-objet tags_by_id : { "uuid": ["tag", ...], ... }.
--- Suffisant pour notre format contrôlé (pas de JSON arbitraire).
+-- Format : { "tags_by_id": { "<id>": [ ["Lieu","Cambodge","Siem Reap"], ... ] } }
+-- Chaque tag est un CHEMIN hiérarchique (tableau de niveaux). Un tag plat est
+-- un chemin à un seul niveau (["temple"]).
 local function parseResults(text)
     local result = {}
     local body = text:match('"tags_by_id"%s*:%s*(%b{})')
     if not body then return result end
-    -- Itère chaque "clé": [ ... ]. Les valeurs de tags ne contiennent pas de
-    -- guillemets (le Python ne produit que des mots-clés simples), donc un motif
-    -- simple "([^"]*)" suffit et reste robuste.
-    for key, arr in body:gmatch('"([^"]+)"%s*:%s*(%b[])') do
-        local tags = {}
-        for tag in arr:gmatch('"([^"]*)"') do
-            tags[#tags + 1] = tag
+    -- Pour chaque "id": [ ... ], on extrait la liste de chemins.
+    for key, outer in body:gmatch('"([^"]+)"%s*:%s*(%b[])') do
+        local paths = {}
+        -- IMPORTANT : retirer les crochets externes du tableau de chemins, sinon
+        -- %b[] re-capturerait tout le bloc au lieu de chaque sous-tableau.
+        local inner = outer:sub(2, -2)
+        -- Chaque chemin est un sous-tableau %b[].
+        for pathArr in inner:gmatch('(%b[])') do
+            local levels = {}
+            for level in pathArr:gmatch('"([^"]*)"') do
+                levels[#levels + 1] = level
+            end
+            if #levels > 0 then
+                paths[#paths + 1] = levels
+            end
         end
-        result[key] = tags
+        result[key] = paths
     end
     return result
 end
@@ -83,6 +92,7 @@ local function showOptionsDialog()
         props.onlineSpecies = true
         props.onlinePlace = false
         props.writeXmp = false
+        props.hierarchical = false  -- mots-clés hiérarchiques
         props.skipTagged = true  -- ignorer les photos déjà taguées IA
         props.suffix = "_AI"  -- suffixe par défaut, modifiable, peut être vide
 
@@ -111,6 +121,7 @@ local function showOptionsDialog()
             f:checkbox{ title = "Passe 2 espèces (BioCLIP, expérimental)", value = LrView.bind("species") },
             f:checkbox{ title = "Filtrer les espèces par GPS via GBIF (réseau)", value = LrView.bind("onlineSpecies") },
             f:checkbox{ title = "Enrichir les lieux via Nominatim/OSM (réseau)", value = LrView.bind("onlinePlace") },
+            f:checkbox{ title = "Mots-clés hiérarchiques (Lieu>Pays>Ville, Faune>Classe>Espèce)", value = LrView.bind("hierarchical") },
             f:checkbox{ title = "Écrire aussi des sidecars .xmp", value = LrView.bind("writeXmp") },
         }
 
@@ -126,6 +137,7 @@ local function showOptionsDialog()
             onlineSpecies = props.onlineSpecies,
             onlinePlace = props.onlinePlace,
             writeXmp = props.writeXmp,
+            hierarchical = props.hierarchical,
             skipTagged = props.skipTagged,
             suffix = props.suffix or "",
         }
@@ -260,10 +272,12 @@ LrTasks.startAsyncTask(function()
     local pycmd = shellQuote(PYTHON_BIN) .. " " .. shellQuote(RUNNER)
         .. " " .. shellQuote(manifestPath) .. " --no-questions"
         .. " --model " .. shellQuote(opts.model)
+        .. " --suffix " .. shellQuote(opts.suffix or "_AI")
     if opts.species        then pycmd = pycmd .. " --species" end
     if not opts.onlineSpecies then pycmd = pycmd .. " --no-online-species" end
     if opts.onlinePlace    then pycmd = pycmd .. " --online-place" end
     if opts.writeXmp       then pycmd = pycmd .. " --write-xmp" end
+    if opts.hierarchical   then pycmd = pycmd .. " --hierarchical" end
 
     -- sous-shell détaché : lance le Python, mémorise son PID (pour pouvoir le
     -- tuer en cas d'annulation), puis écrit son code retour dans done.flag.
@@ -373,30 +387,46 @@ LrTasks.startAsyncTask(function()
         return lower
     end
 
+    -- Crée (ou retrouve) le mot-clé feuille d'un chemin hiérarchique, en créant
+    -- au passage chaque niveau parent. Le suffixe n'est appliqué qu'à la feuille.
+    -- createKeyword(name, synonyms, includeOnExport, parent, returnExisting).
+    local function resolvePath(levels)
+        local parent = nil
+        local leafKw = nil
+        for i, level in ipairs(levels) do
+            local isLeaf = (i == #levels)
+            local name = isLeaf and (level .. suffix) or level
+            leafKw = catalog:createKeyword(name, {}, true, parent, true)
+            if not leafKw then return nil end
+            parent = leafKw
+        end
+        return leafKw
+    end
+
     local nPhotos, nTags, nSkipped = 0, 0, 0
     catalog:withWriteAccessDo("Ajout des mots-clés IA", function()
-        for id, tags in pairs(tagsById) do
+        for id, paths in pairs(tagsById) do
             local photo = photoById[id]
             if photo then
                 nPhotos = nPhotos + 1
 
-                -- Mots-clés déjà présents sur la photo, indexés par base.
+                -- Feuilles déjà présentes sur la photo, indexées par base.
                 local existing = {}
                 for _, kw in ipairs(photo:getRawMetadata("keywords") or {}) do
                     existing[baseOf(kw:getName())] = true
                 end
 
-                for _, tag in ipairs(tags) do
-                    local base = baseOf(tag)  -- le tag IA peut déjà finir par le suffixe
+                for _, levels in ipairs(paths) do
+                    local leaf = levels[#levels]
+                    local base = baseOf(leaf)  -- dédup sur la feuille
                     if existing[base] then
                         nSkipped = nSkipped + 1
                     else
-                        local finalName = tag .. suffix
-                        local kw = catalog:createKeyword(finalName, {}, true, nil, true)
+                        local kw = resolvePath(levels)
                         if kw then
                             photo:addKeyword(kw)
                             nTags = nTags + 1
-                            existing[base] = true  -- évite les doublons dans le même lot
+                            existing[base] = true
                         end
                     end
                 end

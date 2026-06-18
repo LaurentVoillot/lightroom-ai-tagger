@@ -81,8 +81,12 @@ class TagResult:
     species_tags: list[str] = field(default_factory=list)
     categories: list[str] = field(default_factory=list)
     animals: list[DetectedAnimal] = field(default_factory=list)
+    # Versions hiérarchiques (chemins de niveaux) : lieu et espèces.
+    place_path: list[str] = field(default_factory=list)        # ex. [Lieu, FR, ...]
+    species_paths: list[list[str]] = field(default_factory=list)  # [[Faune,...], ...]
 
     def merged(self) -> list[str]:
+        """Tags PLATS (pour rapports CSV/TXT et XMP simple)."""
         seen: set[str] = set()
         out: list[str] = []
         for t in self.place_tags + self.llm_tags + self.species_tags:
@@ -90,6 +94,25 @@ class TagResult:
             if k and k not in seen:
                 seen.add(k)
                 out.append(t.strip())
+        return out
+
+    def merged_hierarchical(self):
+        """Tags pour écriture : chemins hiérarchiques (lieu, espèces) + LLM plats.
+
+        Renvoie une liste où chaque élément est soit un str (tag plat), soit une
+        liste de niveaux (chemin). Le lieu et les espèces deviennent hiérarchiques
+        si leur version chemin est disponible ; sinon on retombe sur le plat.
+        """
+        out: list = []
+        if self.place_path:
+            out.append(self.place_path)
+        else:
+            out.extend(self.place_tags)
+        out.extend(self.llm_tags)
+        if self.species_paths:
+            out.extend(self.species_paths)
+        else:
+            out.extend(self.species_tags)
         return out
 
 
@@ -312,10 +335,14 @@ class TaggingPipeline:
         img = resolved.image
         result = TagResult()
 
-        # Tags de lieu (si GPS + contexte GPS fourni).
+        # Tags de lieu (si GPS + contexte GPS fourni), à plat ET en hiérarchie.
         if self.gps is not None and rec.has_gps and rec.gps_lat is not None:
             try:
-                result.place_tags = self.gps.place_tags(rec.gps_lat, rec.gps_lon).as_tags()
+                pt = self.gps.place_tags(rec.gps_lat, rec.gps_lon)
+                result.place_tags = pt.as_tags()
+                hier = pt.as_hierarchy()
+                if hier:
+                    result.place_path = hier
             except Exception as e:
                 self.log.info("%s : tags lieu indisponibles (%s)", rec.display_name, e)
 
@@ -345,5 +372,10 @@ class TaggingPipeline:
             species = self.species.classify(target, candidates)
             if species:
                 result.species_tags.append(species)
+                # Version hiérarchique taxonomique (Faune>Classe>Famille>Espèce).
+                try:
+                    result.species_paths.append(self.gps.species_hierarchy(species))
+                except Exception:
+                    result.species_paths.append(["Faune", species])
 
         return result

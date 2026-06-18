@@ -198,12 +198,9 @@ def run(manifest_path: str, opts: dict, interactive: bool) -> None:
 
     xmp_writer = None
     if opts["write_xmp"]:
-        try:
-            from xmp_manager import XmpManager  # repris du repo folder-tagger
+        from writers import XmpWriter
 
-            xmp_writer = XmpManager()
-        except Exception as e:
-            log.error("xmp_manager indisponible (%s) — bascule en MODE TEST", e)
+        xmp_writer = XmpWriter(suffix=opts.get("suffix", "_AI"))
 
     txt_lines: list[str] = []
     csv_rows: list[dict] = []
@@ -270,6 +267,7 @@ def run(manifest_path: str, opts: dict, interactive: bool) -> None:
         resolved = ResolvedImage(image=img, kind=SourceKind.ORIGINAL, path=str(jpeg))
 
         all_tags: list[str] = []
+        write_tags = []
         place_tags: list[str] = []
         llm_tags: list[str] = []
         species_tags: list[str] = []
@@ -277,6 +275,7 @@ def run(manifest_path: str, opts: dict, interactive: bool) -> None:
             tr = pipeline.process(rec, resolved)
             place_tags, llm_tags, species_tags = tr.place_tags, tr.llm_tags, tr.species_tags
             all_tags = tr.merged()
+            write_tags = tr.merged_hierarchical() if opts.get("hierarchical") else all_tags
 
         gps_str = (
             f"{rec.gps_lat:.5f},{rec.gps_lon:.5f}"
@@ -292,13 +291,22 @@ def run(manifest_path: str, opts: dict, interactive: bool) -> None:
             )
         txt_lines.append(detail)
         log.info("%s → %d tag(s)", ref, len(all_tags))
-        if all_tags:
-            results[str(entry.get("id", rec.display_name))] = all_tags
+        if write_tags:
+            # results.json pour l'écriture des mots-clés dans LrC par le Lua.
+            # On normalise CHAQUE tag en chemin (liste de niveaux) pour que le
+            # Lua ait un format uniforme : [["Lieu","Cambodge","Siem Reap"], ...].
+            # Le suffixe n'est PAS appliqué ici (le Lua l'ajoute à la feuille).
+            from writers import _as_path
+
+            results[str(entry.get("id", rec.display_name))] = [
+                _as_path(t) for t in write_tags
+            ]
             write_results()  # sauvegarde incrémentale (résistante au kill)
 
-        if xmp_writer is not None and all_tags:
+        if xmp_writer is not None and write_tags:
             try:
-                xmp_writer.write_tags(entry.get("xmp") or rec.xmp_path, all_tags)
+                xmp_path = Path(entry.get("xmp") or rec.xmp_path)
+                xmp_writer.write_tags(xmp_path, write_tags)
                 stats.bump("xmp_written")
             except Exception as e:
                 log.error("%s : écriture XMP échouée (%s)", ref, e)
@@ -356,6 +364,9 @@ def main() -> None:
                     help="Enrichir les lieux via Nominatim (online)")
     ap.add_argument("--write-xmp", action="store_true",
                     help="Écrire aussi des sidecars .xmp")
+    ap.add_argument("--hierarchical", action="store_true",
+                    help="Produire des mots-clés hiérarchiques (lieu, espèces)")
+    ap.add_argument("--suffix", default="_AI", help="Suffixe des tags (def: _AI)")
     args = ap.parse_args()
 
     if args.no_questions:
@@ -366,6 +377,8 @@ def main() -> None:
             "online_species": not args.no_online_species,
             "online_place": args.online_place,
             "write_xmp": args.write_xmp,
+            "hierarchical": args.hierarchical,
+            "suffix": args.suffix,
         }
         interactive = False
     else:

@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -72,6 +73,7 @@ class Worker(QObject):
     """Exécute le mode test dans un thread séparé."""
 
     finished = pyqtSignal()
+    progress = pyqtSignal(int, int, str)  # done, total, nom de la photo courante
 
     def __init__(self, params: dict) -> None:
         super().__init__()
@@ -82,7 +84,8 @@ class Worker(QObject):
         from test_report import run_test
 
         try:
-            run_test(**self.params)
+            run_test(progress_cb=lambda d, t, n: self.progress.emit(d, t, n),
+                     **self.params)
         except Exception as e:  # on ne laisse jamais l'UI planter
             logging.getLogger(LOGGER_NAME).error("Échec du traitement : %s", e)
         finally:
@@ -204,6 +207,12 @@ class MainWindow(QWidget):
         self.suffix_edit.setMaximumWidth(120)
         wg.addWidget(self.suffix_edit, 3, 1)
         wg.addWidget(QLabel("(vide = aucun suffixe ; non destructif)"), 3, 2)
+
+        self.hier_check = QCheckBox(
+            "Mots-clés hiérarchiques (Lieu>Pays>Ville, Faune>Classe>Espèce)"
+        )
+        self.hier_check.setEnabled(False)
+        wg.addWidget(self.hier_check, 4, 0, 1, 3)
         root.addWidget(wr)
 
         # --- Actions ---
@@ -229,6 +238,11 @@ class MainWindow(QWidget):
             "background:#1e1e1e; font-family:Menlo,monospace; font-size:12px;"
         )
         root.addWidget(self.log_view, stretch=1)
+
+        # --- Progression ---
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        root.addWidget(self.progress_bar)
 
         self.status = QLabel("Prêt.")
         root.addWidget(self.status)
@@ -336,6 +350,7 @@ class MainWindow(QWidget):
         self.xmp_check.setEnabled(not checked)
         self.catalog_check.setEnabled(not checked)
         self.suffix_edit.setEnabled(not checked)
+        self.hier_check.setEnabled(not checked)
         self.run_btn.setText("Lancer le mode test" if checked else "Lancer le taggage")
 
     def _run(self) -> None:
@@ -398,20 +413,30 @@ class MainWindow(QWidget):
             suffix=self.suffix_edit.text(),
             selected_only=selected_only,
             skip_tagged=self.skip_tagged_check.isChecked(),
+            hierarchical=(not test_mode) and self.hier_check.isChecked(),
         )
         self.run_btn.setEnabled(False)
         self.status.setText("Traitement en cours…")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
 
         self._thread = QThread()
         self._worker = Worker(params)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_done)
         self._worker.finished.connect(self._thread.quit)
         self._thread.start()
 
+    def _on_progress(self, done: int, total: int, name: str) -> None:
+        self.progress_bar.setMaximum(max(total, 1))
+        self.progress_bar.setValue(done)
+        self.progress_bar.setFormat(f"%v / %m — {name}")
+
     def _on_done(self) -> None:
         self.run_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
         self.status.setText(
             "Terminé. infos: %d · warnings: %d · erreurs: %d"
             % (self._counts["info"], self._counts["warning"], self._counts["error"])

@@ -62,12 +62,17 @@ class PhotoRecord:
 class CatalogReader:
     """Accès lecture seule au catalogue Lightroom."""
 
-    def __init__(self, lrcat_path: str | Path):
+    def __init__(self, lrcat_path: str | Path, immutable: bool = True):
         self.lrcat_path = Path(lrcat_path)
         if not self.lrcat_path.is_file():
             raise FileNotFoundError(f"Catalogue introuvable : {self.lrcat_path}")
-        uri = f"file:{self.lrcat_path}?mode=ro&immutable=1"
-        # immutable=1 => aucun verrou, aucune écriture possible.
+        # immutable=1 => aucun verrou, lecture la plus rapide, MAIS le cache est
+        # figé : à éviter si un CatalogWriter écrit le même fichier en parallèle.
+        # Dans ce cas on ouvre en RO simple (immutable=False) pour voir les écritures.
+        if immutable:
+            uri = f"file:{self.lrcat_path}?mode=ro&immutable=1"
+        else:
+            uri = f"file:{self.lrcat_path}?mode=ro"
         self.conn = sqlite3.connect(uri, uri=True)
         self.conn.row_factory = sqlite3.Row
 

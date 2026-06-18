@@ -43,6 +43,22 @@ def bare_tag(tag: str, suffix: str) -> str:
     return tl
 
 
+def _as_path(tag) -> list[str]:
+    """Normalise un tag en chemin hiérarchique (liste de niveaux).
+
+    Accepte : une liste/tuple de niveaux, ou une string. Une string contenant
+    '>' est découpée en niveaux ('Lieu>France>Isère'). Sinon, tag plat.
+    """
+    if isinstance(tag, (list, tuple)):
+        parts = [str(p).strip() for p in tag if str(p).strip()]
+        return parts or ["?"]
+    s = str(tag).strip()
+    if ">" in s:
+        parts = [p.strip() for p in s.split(">") if p.strip()]
+        return parts or ["?"]
+    return [s]
+
+
 # --------------------------------------------------------------------------
 # Détection de verrou catalogue (sécurité avant écriture dans le .lrcat)
 # --------------------------------------------------------------------------
@@ -77,6 +93,7 @@ _NS = {
     "x": "adobe:ns:meta/",
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
     "dc": "http://purl.org/dc/elements/1.1/",
+    "lr": "http://ns.adobe.com/lightroom/1.0/",
 }
 
 _XMP_TEMPLATE = """\
@@ -84,7 +101,8 @@ _XMP_TEMPLATE = """\
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="photo-tagger">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
     <rdf:Description rdf:about=""
-      xmlns:dc="http://purl.org/dc/elements/1.1/">
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      xmlns:lr="http://ns.adobe.com/lightroom/1.0/">
     </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -121,27 +139,44 @@ class XmpWriter:
                             tags.append(li.text.strip())
         return tags
 
-    def write_tags(self, xmp_path: Path, ai_tags: list[str]) -> int:
-        """Fusionne ai_tags (suffixés) avec l'existant. Renvoie le nb ajouté."""
+    def write_tags(self, xmp_path: Path, ai_tags: list) -> int:
+        """Fusionne ai_tags avec l'existant (non destructif). Renvoie le nb ajouté.
+
+        ai_tags : chaque élément est un tag plat (str), un chemin 'a>b>c' (str)
+        ou une liste de niveaux. Le suffixe est appliqué à la FEUILLE.
+        On écrit dc:subject (feuilles plates, pour la recherche) ET
+        lr:hierarchicalSubject (chemins complets, pour l'arbre Lightroom).
+        """
         if not ai_tags:
             return 0
-        suffixed = [
-            f"{t}{self.suffix}" if self.suffix else t for t in ai_tags
-        ]
-        existing = self.read_tags(xmp_path)
-        seen = {bare_tag(t, self.suffix) for t in existing}
+
+        # Normalise chaque tag en chemin, puis applique le suffixe à la feuille.
+        new_paths: list[list[str]] = []
+        for tag in ai_tags:
+            path = _as_path(tag)
+            if self.suffix:
+                path = path[:-1] + [f"{path[-1]}{self.suffix}"]
+            new_paths.append(path)
+
+        # Existant : on lit les feuilles plates pour dédupliquer.
+        existing_flat = self.read_tags(xmp_path)
+        existing_hier = self._read_hierarchical(xmp_path)
+        seen = {bare_tag(t, self.suffix) for t in existing_flat}
+
+        final_flat = list(existing_flat)
+        final_hier = list(existing_hier)
         added = 0
-        final = list(existing)
-        for tag in suffixed:
-            b = bare_tag(tag, self.suffix)
-            if b not in seen:
-                final.append(tag)
-                seen.add(b)
-                added += 1
+        for path in new_paths:
+            leaf = path[-1]
+            if bare_tag(leaf, self.suffix) in seen:
+                continue
+            final_flat.append(leaf)
+            final_hier.append("|".join(path))
+            seen.add(bare_tag(leaf, self.suffix))
+            added += 1
         if added == 0:
             return 0
 
-        # Charge ou crée l'arbre, puis remplace le bloc dc:subject par final.
         if xmp_path.exists():
             try:
                 parser = etree.XMLParser(recover=True, encoding="UTF-8")
@@ -154,7 +189,11 @@ class XmpWriter:
             root = etree.fromstring(_XMP_TEMPLATE.encode("UTF-8"))
             tree = etree.ElementTree(root)
 
-        if not self._set_subject(root, final):
+        ok = self._set_bag(root, _NS["dc"], "subject", final_flat)
+        # hierarchicalSubject n'a de sens que si au moins un chemin a >1 niveau.
+        if any("|" in h for h in final_hier):
+            ok = self._set_bag(root, _NS["lr"], "hierarchicalSubject", final_hier) and ok
+        if not ok:
             return 0
         try:
             tree.write(str(xmp_path), xml_declaration=False,
@@ -165,8 +204,23 @@ class XmpWriter:
             return 0
         return added
 
-    def _set_subject(self, root, tags: list[str]) -> bool:
-        dc, rdf = _NS["dc"], _NS["rdf"]
+    def _read_hierarchical(self, xmp_path: Path) -> list[str]:
+        if not xmp_path.exists():
+            return []
+        try:
+            root = etree.parse(str(xmp_path)).getroot()
+        except Exception:
+            return []
+        lr, rdf = _NS["lr"], _NS["rdf"]
+        out: list[str] = []
+        for hs in root.iter(f"{{{lr}}}hierarchicalSubject"):
+            for li in hs.iter(f"{{{rdf}}}li"):
+                if li.text and li.text.strip():
+                    out.append(li.text.strip())
+        return out
+
+    def _set_bag(self, root, ns: str, tag_name: str, values: list[str]) -> bool:
+        rdf = _NS["rdf"]
         rdf_rdf = next(root.iter(f"{{{rdf}}}RDF"), None)
         if rdf_rdf is None:
             return False
@@ -174,12 +228,12 @@ class XmpWriter:
         if desc is None:
             desc = etree.SubElement(rdf_rdf, f"{{{rdf}}}Description")
             desc.set(f"{{{rdf}}}about", "")
-        for s in desc.findall(f"{{{dc}}}subject"):
+        for s in desc.findall(f"{{{ns}}}{tag_name}"):
             desc.remove(s)
-        subject = etree.SubElement(desc, f"{{{dc}}}subject")
-        bag = etree.SubElement(subject, f"{{{rdf}}}Bag")
-        for t in tags:
-            etree.SubElement(bag, f"{{{rdf}}}li").text = t
+        container = etree.SubElement(desc, f"{{{ns}}}{tag_name}")
+        bag = etree.SubElement(container, f"{{{rdf}}}Bag")
+        for v in values:
+            etree.SubElement(bag, f"{{{rdf}}}li").text = v
         return True
 
     @staticmethod
@@ -240,26 +294,73 @@ class CatalogWriter:
         )
         return [r[0] for r in cur.fetchall() if r[0]]
 
-    def _get_or_create_keyword(self, cur: sqlite3.Cursor, name: str) -> int | None:
-        cur.execute("SELECT id_local FROM AgLibraryKeyword WHERE name = ?", (name,))
+    @staticmethod
+    def _genealogy(parent_gen: str | None, new_id: int) -> str:
+        """Genealogy Lightroom : chaque ancêtre encodé '/<nb_chiffres><id>'.
+
+        Ex. id 20 -> '/220' ; enfant id 231 sous /220 -> '/220/3231'. Vérifié
+        sur le catalogue réel (rebuild == stocké, 100 %).
+        """
+        seg = f"/{len(str(new_id))}{new_id}"
+        return (parent_gen or "") + seg
+
+    def _get_or_create_keyword(
+        self, cur: sqlite3.Cursor, name: str, parent_id: int | None,
+        parent_gen: str | None,
+    ) -> tuple[int, str] | None:
+        """Trouve/crée un mot-clé sous un parent donné. Renvoie (id, genealogy)."""
+        # Unicité par (name, parent) : un même nom peut exister sous 2 parents.
+        if parent_id is None:
+            cur.execute(
+                "SELECT id_local, genealogy FROM AgLibraryKeyword "
+                "WHERE name = ? AND parent IS NULL", (name,))
+        else:
+            cur.execute(
+                "SELECT id_local, genealogy FROM AgLibraryKeyword "
+                "WHERE name = ? AND parent = ?", (name, parent_id))
         row = cur.fetchone()
         if row:
-            return row[0]
+            return row[0], row[1]
         id_global = str(uuid.uuid4()).upper()
         cur.execute("SELECT MAX(id_local) FROM AgLibraryKeyword")
         new_id = (cur.fetchone()[0] or 0) + 1
+        gen = self._genealogy(parent_gen, new_id)
         cur.execute(
             """
             INSERT INTO AgLibraryKeyword
-                (id_local, id_global, name, lc_name, dateCreated, genealogy)
-            VALUES (?, ?, ?, ?, datetime('now'), ?)
+                (id_local, id_global, name, lc_name, dateCreated, genealogy, parent)
+            VALUES (?, ?, ?, ?, datetime('now'), ?, ?)
             """,
-            (new_id, id_global, name, name.lower(), f"/{name}"),
+            (new_id, id_global, name, name.lower(), gen, parent_id),
         )
-        return new_id
+        return new_id, gen
 
-    def add_tags(self, image_id: int, ai_tags: list[str]) -> int:
-        """Ajoute les tags (suffixés) à une image, sans doublon. Renvoie nb ajouté."""
+    def _resolve_path(self, cur: sqlite3.Cursor, path: list[str]) -> int | None:
+        """Crée la chaîne de mots-clés d'un chemin hiérarchique. Renvoie l'id feuille.
+
+        Le suffixe IA n'est appliqué QU'À LA FEUILLE (les niveaux parents restent
+        des catégories propres, partagées avec d'éventuels tags manuels).
+        """
+        parent_id: int | None = None
+        parent_gen: str | None = None
+        leaf_id: int | None = None
+        for i, level in enumerate(path):
+            is_leaf = i == len(path) - 1
+            name = f"{level}{self.suffix}" if (is_leaf and self.suffix) else level
+            res = self._get_or_create_keyword(cur, name, parent_id, parent_gen)
+            if res is None:
+                return None
+            parent_id, parent_gen = res
+            leaf_id = res[0]
+        return leaf_id
+
+    def add_tags(self, image_id: int, ai_tags) -> int:
+        """Ajoute des tags à une image, sans doublon. Renvoie le nb ajouté.
+
+        ai_tags : liste où chaque élément est soit une string (tag plat), soit
+        une liste de niveaux (chemin hiérarchique, ex. ['Lieu','France','Isère']).
+        Une string contenant '>' est aussi traitée comme un chemin.
+        """
         if not ai_tags:
             return 0
         existing = self.existing_tags(image_id)
@@ -269,10 +370,12 @@ class CatalogWriter:
         try:
             cur.execute("BEGIN")
             for tag in ai_tags:
-                final_name = f"{tag}{self.suffix}" if self.suffix else tag
-                if bare_tag(final_name, self.suffix) in seen:
+                path = _as_path(tag)
+                leaf = path[-1]
+                # dédup sur la feuille (forme nue), comme pour les tags plats.
+                if bare_tag(f"{leaf}{self.suffix}", self.suffix) in seen:
                     continue
-                kw_id = self._get_or_create_keyword(cur, final_name)
+                kw_id = self._resolve_path(cur, path)
                 if kw_id is None:
                     continue
                 cur.execute(
@@ -285,7 +388,7 @@ class CatalogWriter:
                     "INSERT INTO AgLibraryKeywordImage (image, tag) VALUES (?, ?)",
                     (image_id, kw_id),
                 )
-                seen.add(bare_tag(final_name, self.suffix))
+                seen.add(bare_tag(f"{leaf}{self.suffix}", self.suffix))
                 added += 1
             self.conn.commit()
         except sqlite3.Error as e:

@@ -68,6 +68,8 @@ def run_test(
     suffix: str = "_AI",
     selected_only: bool = False,
     skip_tagged: bool = True,
+    hierarchical: bool = False,
+    progress_cb=None,
 ) -> None:
     out = Path(out_dir) if out_dir else Path.cwd()
     stats = RunStats()
@@ -116,7 +118,9 @@ def run_test(
             log.error("Écriture catalogue impossible : %s", e)
             write_catalog = False
 
-    with CatalogReader(lrcat) as cat:
+    # Si on écrit dans le catalogue, le reader doit voir les écritures du writer
+    # -> pas de mode immutable (B2 : éviter reader figé + writer RW concurrent).
+    with CatalogReader(lrcat, immutable=not write_catalog) as cat:
         # Périmètre : sélection courante (persistée par LrC) ou filtre dossier.
         image_ids = None
         if selected_only:
@@ -175,7 +179,10 @@ def run_test(
         csv_rows: list[dict] = []
         by_folder: dict[str, list[str]] = defaultdict(list)
 
-        for rec in records:
+        total_records = len(records)
+        for idx, rec in enumerate(records, 1):
+            if progress_cb is not None:
+                progress_cb(idx, total_records, rec.display_name)
             resolved: ResolvedImage | None = resolver.resolve(rec)
             num = folder_num[rec.folder_abs]
             ref = f"{num}/{rec.display_name}"
@@ -210,6 +217,7 @@ def run_test(
             )
             # Tags : produits par le pipeline si activé, sinon vide.
             all_tags: list[str] = []
+            write_tags = []  # ce qu'on écrit réellement (plat ou hiérarchique)
             place_tags: list[str] = []
             llm_tags: list[str] = []
             species_tags: list[str] = []
@@ -219,6 +227,7 @@ def run_test(
                     tr.place_tags, tr.llm_tags, tr.species_tags
                 )
                 all_tags = tr.merged()
+                write_tags = tr.merged_hierarchical() if hierarchical else all_tags
 
             detail = (
                 f"{ref}\n      source : {src} ({resolved.image.size[0]}x{resolved.image.size[1]})"
@@ -232,15 +241,13 @@ def run_test(
                 )
 
             # Écriture réelle (hors mode test) : XMP et/ou catalogue, non destructif.
-            if all_tags and xmp_writer is not None:
-                added = xmp_writer.write_tags(
-                    Path(rec.xmp_path), all_tags
-                )
+            if write_tags and xmp_writer is not None:
+                added = xmp_writer.write_tags(Path(rec.xmp_path), write_tags)
                 if added:
                     stats.bump("xmp_written", added)
                 detail += f"\n      xmp    : +{added} tag(s)"
-            if all_tags and catalog_writer is not None:
-                added = catalog_writer.add_tags(rec.image_id, all_tags)
+            if write_tags and catalog_writer is not None:
+                added = catalog_writer.add_tags(rec.image_id, write_tags)
                 if added:
                     stats.bump("catalog_written", added)
                 detail += f"\n      base   : +{added} tag(s)"
@@ -262,6 +269,21 @@ def run_test(
 
     if catalog_writer is not None:
         catalog_writer.close()
+    if pipeline is not None and pipeline.gps is not None:
+        pipeline.gps.flush()  # B3 : écrit les caches GPS accumulés
+
+    # --- Détection « mauvais catalogue / source introuvable » ---
+    # Si des photos étaient dans le périmètre mais que TOUTES ont échoué à la
+    # résolution d'image, c'est typiquement le mauvais catalogue (ex. cloud) ou
+    # un volume démonté. On le signale clairement.
+    n_in_scope = len(records)
+    n_unavailable = stats.counter.get("skipped", 0)
+    if n_in_scope > 0 and n_unavailable == n_in_scope:
+        log.error(
+            "AUCUNE image n'a pu être chargée (%d/%d). Catalogue inadapté "
+            "(catalogue cloud/mobile ?) ou volume des originaux démonté.",
+            n_unavailable, n_in_scope,
+        )
 
     # --- Écriture des rapports (dans out_dir, jamais dans le catalogue) ---
     txt_path = out / "rapport_test.txt"
@@ -342,6 +364,8 @@ def main() -> None:
                     help="Traiter la sélection courante (persistée par LrC) au lieu d'un dossier")
     ap.add_argument("--no-skip-tagged", action="store_true",
                     help="Ne pas ignorer les photos déjà taguées par l'IA (même suffixe)")
+    ap.add_argument("--hierarchical", action="store_true",
+                    help="Écrire des mots-clés hiérarchiques (lieu, espèces) au lieu de plats")
     args = ap.parse_args()
 
     run_test(
@@ -361,6 +385,7 @@ def main() -> None:
         suffix=args.suffix,
         selected_only=args.selected,
         skip_tagged=not args.no_skip_tagged,
+        hierarchical=args.hierarchical,
     )
 
 
