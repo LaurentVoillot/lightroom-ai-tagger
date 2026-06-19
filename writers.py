@@ -38,22 +38,35 @@ from log_panel import get_logger
 def bare_tag(tag: str, suffix: str) -> str:
     """Renvoie le tag sans son suffixe, en minuscules (clé de déduplication)."""
     tl = tag.lower()
+    # .endswith(s) = test de suffixe (comme String.endsWith).
     if suffix and tl.endswith(suffix.lower()):
+        # PYTHON — SLICE NÉGATIF : tl[:-n] = « tout sauf les n derniers
+        # caractères ». Les index négatifs comptent depuis la fin. Ici on retire
+        # le suffixe de longueur len(suffix). tl[:-3] enlève les 3 derniers.
         return tl[: -len(suffix)]
     return tl
 
 
+# PYTHON — paramètre SANS annotation de type (`tag` tout court) : volontaire ici,
+# car la fonction accepte plusieurs types (DUCK TYPING). On teste le type à
+# l'intérieur. Python étant dynamique, une fonction peut accepter « tout ce qui
+# se comporte comme attendu ».
 def _as_path(tag) -> list[str]:
     """Normalise un tag en chemin hiérarchique (liste de niveaux).
 
     Accepte : une liste/tuple de niveaux, ou une string. Une string contenant
     '>' est découpée en niveaux ('Lieu>France>Isère'). Sinon, tag plat.
     """
+    # isinstance(x, (A, B)) : x est-il une instance de A OU de B ? (tuple de types).
     if isinstance(tag, (list, tuple)):
+        # comprehension avec str(p).strip() évalué : on nettoie chaque niveau et
+        # on écarte les vides. (Petite inefficience : str(p).strip() calculé 2×.)
         parts = [str(p).strip() for p in tag if str(p).strip()]
+        # `parts or ["?"]` : si parts est vide (falsy), renvoie ["?"] à la place.
         return parts or ["?"]
     s = str(tag).strip()
-    if ">" in s:
+    if ">" in s:                      # `in` sur une str = test de sous-chaîne (contains)
+        # .split(">") découpe la chaîne sur chaque ">" -> liste de morceaux.
         parts = [p.strip() for p in s.split(">") if p.strip()]
         return parts or ["?"]
     return [s]
@@ -71,17 +84,22 @@ def catalog_is_locked(lrcat_path: str | Path) -> bool:
     d'acquérir un verrou d'écriture SQLite (BEGIN IMMEDIATE) sans rien modifier.
     """
     p = Path(lrcat_path)
+    # p.suffix = extension (".lrcat") ; on teste l'existence d'un "...lrcat.lock".
     if p.with_suffix(p.suffix + ".lock").exists():
         return True
     try:
         con = sqlite3.connect(str(p), timeout=1.0)
+        # PYTHON — try/finally IMBRIQUÉ : le bloc `finally` s'exécute TOUJOURS
+        # (succès, return, ou exception) -> garantit con.close(). C'est le filet
+        # de sécurité « quoi qu'il arrive, ferme la connexion ».
         try:
-            con.execute("BEGIN IMMEDIATE")
-            con.rollback()
+            con.execute("BEGIN IMMEDIATE")  # tente un verrou d'écriture
+            con.rollback()                  # ... qu'on annule aussitôt (test seul)
             return False
         finally:
             con.close()
     except sqlite3.OperationalError:
+        # Échec du verrou = quelqu'un d'autre (Lightroom) écrit déjà -> verrouillé.
         return True
 
 

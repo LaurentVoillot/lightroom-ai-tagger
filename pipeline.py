@@ -76,6 +76,11 @@ class DetectedAnimal:
 class TagResult:
     """Résultat de tagging d'une photo, avec provenance des tags."""
 
+    # PYTHON — PIÈGE CLASSIQUE : on ne peut PAS écrire `place_tags: list = []`
+    # comme défaut, car ce `[]` serait PARTAGÉ par toutes les instances (objet
+    # mutable créé une seule fois). La solution dataclass est
+    # `field(default_factory=list)` : appelle `list()` (liste vide NEUVE) pour
+    # CHAQUE instance. Vaut pour tout défaut mutable (list, dict, set).
     place_tags: list[str] = field(default_factory=list)
     llm_tags: list[str] = field(default_factory=list)
     species_tags: list[str] = field(default_factory=list)
@@ -184,6 +189,9 @@ class OllamaVision:
     ) -> tuple[list[str], list[str], list["DetectedAnimal"]]:
         """Renvoie (tags, categories, animals). Listes vides si échec."""
         try:
+            # PYTHON — requests : lib HTTP (pip). `json={...}` sérialise un dict
+            # Python en JSON pour le corps de la requête. Un dict imbriqué donne
+            # un objet JSON imbriqué. C'est l'appel à Ollama (LLM local).
             r = requests.post(
                 self.url,
                 json={
@@ -197,15 +205,23 @@ class OllamaVision:
             )
             if not r.ok:
                 self.log.warning("Ollama HTTP %s", r.status_code)
+                # PYTHON — on renvoie un TUPLE de 3 listes vides : `return a, b, c`
+                # crée le tuple (a, b, c) implicitement (parenthèses optionnelles).
                 return [], [], []
+            # .get("response", "") : lecture d'un dict avec DÉFAUT si clé absente
+            # (renvoie "" au lieu de lever KeyError). Idiome très courant.
             data = self._extract_json(r.json().get("response", ""))
-            # On ne garde que des tags STRING : sous température, le modèle peut
-            # renvoyer un nombre ou un objet, qu'on ne veut pas écrire en mot-clé.
+            # PYTHON — LIST COMPREHENSION AVEC FILTRE : [expr for x in src if cond].
+            # isinstance(t, str) = test de type runtime (le LLM peut renvoyer
+            # n'importe quoi). .strip() enlève les espaces ; une str vide est falsy.
             tags = [t.strip() for t in data.get("tags", []) if isinstance(t, str) and t.strip()]
             cats = [str(c).lower() for c in data.get("categories", []) if isinstance(c, str)]
             cats = [c for c in cats if c and c != "none"]
             animals = self._parse_animals(data)
             return tags, cats, animals
+        # PYTHON — plusieurs `except` : on attrape d'abord le cas réseau précis,
+        # puis tout le reste (Exception). L'ordre compte (du plus spécifique au
+        # plus général). `as e` lie l'exception à la variable e.
         except requests.exceptions.RequestException as e:
             self.log.error("Ollama injoignable (%s)", e)
             return [], [], []
@@ -347,6 +363,9 @@ class TaggingPipeline:
                 self.log.info("%s : tags lieu indisponibles (%s)", rec.display_name, e)
 
         # Passe 1 : LLM généraliste + grounding des animaux au premier plan.
+        # PYTHON — UNPACKING MULTIPLE : analyze() renvoie un tuple (tags, cats,
+        # animals) qu'on déballe directement dans 3 cibles à gauche du `=`.
+        # On peut même cibler des attributs (result.llm_tags = ...).
         result.llm_tags, result.categories, result.animals = self.ollama.analyze(img)
 
         # Passe 2 : identification fine, UNIQUEMENT pour les animaux que le LLM a

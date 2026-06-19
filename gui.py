@@ -69,14 +69,21 @@ class QtLogHandler(logging.Handler, QObject):
         self.record.emit(self.format(rec), rec.levelno)
 
 
+# PYTHON/Qt — un Worker hérite de QObject (classe de base Qt). super().__init__()
+# appelle le constructeur PARENT (obligatoire ici pour initialiser QObject).
 class Worker(QObject):
     """Exécute le mode test dans un thread séparé."""
 
+    # PYTHON/Qt — SIGNALS : attributs de classe `pyqtSignal(...)`. Mécanisme
+    # signal/slot de Qt : un signal est ÉMIS (`.emit(...)`) depuis le thread de
+    # travail et reçu par des « slots » (méthodes) connectés côté UI. C'est la
+    # façon thread-safe de communiquer du worker vers l'interface. Les types
+    # entre parenthèses = signature des données transmises.
     finished = pyqtSignal()
     progress = pyqtSignal(int, int, str)  # done, total, nom de la photo courante
 
     def __init__(self, params: dict) -> None:
-        super().__init__()
+        super().__init__()   # initialise la partie QObject (équiv. super() Java/C++)
         self.params = params
 
     def run(self) -> None:
@@ -85,6 +92,12 @@ class Worker(QObject):
 
         log = logging.getLogger(LOGGER_NAME)
         try:
+            # PYTHON — deux idiomes :
+            #  1) `lambda d, t, n: ...` = fonction ANONYME en ligne (callback). Ici
+            #     elle relaie la progression vers le signal Qt.
+            #  2) `**self.params` = UNPACKING d'un dict en arguments nommés : si
+            #     params = {"lrcat": x, "limit": 10}, ça appelle
+            #     run_test(lrcat=x, limit=10, ...). Évite d'énumérer 15 paramètres.
             run_test(progress_cb=lambda d, t, n: self.progress.emit(d, t, n),
                      **self.params)
         except Exception as e:  # on ne laisse jamais l'UI planter
@@ -237,12 +250,18 @@ class MainWindow(QWidget):
         actions = QHBoxLayout()
         self.run_btn = QPushButton("Lancer le mode test")
         self.run_btn.clicked.connect(self._run)
+        # Arrêt PROPRE : pose un stop.flag ; le traitement s'arrête à la fin de
+        # la photo en cours, après commit et fermeture des fichiers.
+        self.stop_btn = QPushButton("Arrêter proprement")
+        self.stop_btn.clicked.connect(self._request_stop)
+        self.stop_btn.setEnabled(False)
         clear_btn = QPushButton("Effacer le log")
         clear_btn.clicked.connect(lambda: self.log_view.clear())
         self.level_filter = QComboBox()
         self.level_filter.addItems(["Tout", "Warnings et +", "Erreurs"])
         self.level_filter.currentIndexChanged.connect(self._apply_filter)
         actions.addWidget(self.run_btn)
+        actions.addWidget(self.stop_btn)
         actions.addWidget(clear_btn)
         actions.addStretch()
         actions.addWidget(QLabel("Filtre :"))
@@ -471,13 +490,22 @@ class MainWindow(QWidget):
         perim = self.perimeter_combo.currentIndex()
         selected_only = perim == 1
         scope = self._current_scope() if perim == 0 else None
+
+        # Fichier d'arrêt propre, dans le dossier de sortie. On le nettoie avant
+        # de lancer, et le bouton Stop le créera pour demander l'arrêt.
+        out_dir = self.out_edit.text().strip() or str(Path.home() / "phototagger_out")
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        self._stop_flag_path = str(Path(out_dir) / "stop.flag")
+        if Path(self._stop_flag_path).exists():
+            Path(self._stop_flag_path).unlink()
+
         params = dict(
             lrcat=lrcat,
             scope=scope,
             limit=limit,
             gps_only=self.gps_only.isChecked(),
             order=self._parse_order(),
-            out_dir=self.out_edit.text().strip() or None,
+            out_dir=out_dir,
             tag=self.tag_check.isChecked(),
             model=self.model_combo.currentText().strip(),
             species_pass=self.species_check.isChecked(),
@@ -489,20 +517,38 @@ class MainWindow(QWidget):
             skip_tagged=self.skip_tagged_check.isChecked(),
             hierarchical=(not test_mode) and self.hier_check.isChecked(),
             resume=self.resume_check.isChecked(),
+            stop_flag=self._stop_flag_path,
         )
         self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
         self.status.setText("Traitement en cours…")
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
 
+        # PYTHON/Qt — THREADING Qt : on crée un QThread, on y DÉPLACE le worker
+        # (moveToThread), puis on relie les signaux aux slots via `.connect()`.
+        # Le traitement lourd tourne hors du thread UI -> l'interface reste
+        # réactive. Stocker self._thread/self._worker comme attributs est
+        # IMPORTANT : sinon le ramasse-miettes Python les détruirait en cours.
         self._thread = QThread()
         self._worker = Worker(params)
         self._worker.moveToThread(self._thread)
+        # `.connect(slot)` : quand le signal de gauche est émis, le slot de droite
+        # (une méthode) est appelé. C'est l'abonnement signal -> handler.
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_done)
         self._worker.finished.connect(self._thread.quit)
         self._thread.start()
+
+    def _request_stop(self) -> None:
+        """Demande l'arrêt propre : crée le stop.flag. Le run s'arrête à la fin
+        de la photo en cours (commit + fermeture des fichiers déjà gérés)."""
+        path = getattr(self, "_stop_flag_path", None)
+        if path:
+            Path(path).write_text("stop", encoding="utf-8")
+            self.stop_btn.setEnabled(False)
+            self.status.setText("Arrêt demandé — fin de la photo en cours…")
 
     def _on_progress(self, done: int, total: int, name: str) -> None:
         self.progress_bar.setMaximum(max(total, 1))
@@ -511,7 +557,15 @@ class MainWindow(QWidget):
 
     def _on_done(self) -> None:
         self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
+        # Nettoie un éventuel stop.flag résiduel pour le prochain run.
+        path = getattr(self, "_stop_flag_path", None)
+        if path and Path(path).exists():
+            try:
+                Path(path).unlink()
+            except Exception:
+                pass
         self.status.setText(
             "Terminé. infos: %d · warnings: %d · erreurs: %d"
             % (self._counts["info"], self._counts["warning"], self._counts["error"])

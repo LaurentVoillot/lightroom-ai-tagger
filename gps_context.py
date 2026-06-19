@@ -56,6 +56,9 @@ _CLASS_FR = {
 }
 
 
+# PYTHON — dataclass avec VALEURS PAR DÉFAUT (= None) sur chaque champ : on peut
+# construire PlaceTags() sans argument (tous None), ou PlaceTags(country="FR").
+# Les champs avec défaut doivent venir APRÈS ceux sans défaut (comme les params).
 @dataclass
 class PlaceTags:
     """Tags de lieu dérivés des coordonnées."""
@@ -67,8 +70,12 @@ class PlaceTags:
     poi: str | None = None      # point d'intérêt (online uniquement)
 
     def as_tags(self) -> list[str]:
+        # [a, b, c] = liste littérale. self.country etc. accèdent aux champs.
         vals = [self.country, self.admin1, self.admin2, self.city, self.poi]
-        # dédup en conservant l'ordre, en ignorant les None/vides
+        # PYTHON — idiome de DÉDUPLICATION EN PRÉSERVANT L'ORDRE : un set ne garde
+        # pas l'ordre, donc on combine un set `seen` (test rapide « déjà vu ? »)
+        # avec une liste `out` (résultat ordonné). `if v and v not in seen` :
+        # ignore les None/vides ET les doublons.
         seen: set[str] = set()
         out: list[str] = []
         for v in vals:
@@ -164,15 +171,21 @@ class GpsContext:
 
     def flush(self) -> None:
         """Écrit sur disque les caches modifiés depuis le dernier flush."""
+        # PYTHON — DICT LITTÉRAL : { clé: valeur, ... }. Ici les valeurs sont des
+        # TUPLES (chemin, données). On mappe un nom -> (où écrire, quoi écrire).
         targets = {
             "place": (self._place_cache_path, self._place_cache),
             "species": (self._species_cache_path, self._species_cache),
             "taxo": (self._taxo_cache_path, self._taxo_cache),
         }
+        # `list(self._dirty)` fait une COPIE du set avant d'itérer, car on modifie
+        # le set d'origine (clear) ensuite — itérer en modifiant est risqué.
         for which in list(self._dirty):
+            # PYTHON — TUPLE UNPACKING : `path, data = (a, b)` affecte a à path et
+            # b à data en une ligne (destructuring). Très idiomatique.
             path, data = targets[which]
             self._save_json(path, data)
-        self._dirty.clear()
+        self._dirty.clear()       # vide le set en place
         self._writes_since_flush = 0
 
     def close(self) -> None:
@@ -199,12 +212,23 @@ class GpsContext:
 
     def place_tags(self, lat: float, lon: float) -> PlaceTags:
         """Tags de lieu, offline par défaut, online si activé (avec cache)."""
+        # round(x, 4) arrondit à 4 décimales -> clé de cache ~11 m de précision.
         key = f"{round(lat, 4)},{round(lon, 4)}"
+        # `key in dict` teste la présence d'une CLÉ (pas d'une valeur). O(1).
         if key in self._place_cache:
             # Robuste à un changement de schéma de PlaceTags : on ne garde que
             # les champs encore connus (un vieux cache ne fait pas planter).
             cached = self._place_cache[key]
+            # fields(PlaceTags) (de dataclasses) liste les champs ; on en fait un
+            # set de noms valides via une set-comprehension.
             valid = {f.name for f in fields(PlaceTags)}
+            # PYTHON — deux idiomes combinés :
+            #  1) DICT COMPREHENSION {k: v for k, v in d.items() if ...} : filtre
+            #     le dict caché pour ne garder que les clés connues.
+            #  2) `**dict` = UNPACKING DE DICT en arguments nommés : PlaceTags(**{
+            #     "country": "FR"}) revient à PlaceTags(country="FR"). C'est la
+            #     « splat » : on déballe un dict en kwargs. (`*liste` fait pareil
+            #     pour les args positionnels.)
             return PlaceTags(**{k: v for k, v in cached.items() if k in valid})
 
         tags = self._place_offline(lat, lon)

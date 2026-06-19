@@ -25,51 +25,72 @@ le marqueur de début (FFD8FF) et de fin (FFD9). La table `root-pixels.db`
 
 from __future__ import annotations
 
-import glob
-import io
+import glob   # recherche de fichiers par motif (wildcards), comme un `ls *.txt`
+import io     # flux en mémoire (BytesIO = « fichier » RAM, voir plus bas)
 import os
 import sqlite3
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+# PYTHON — `from PIL import Image` : PIL = Pillow, la lib d'images (à installer
+# via pip, ce n'est pas la stdlib). `Image` est la classe centrale.
 from PIL import Image
 
+# Imports de NOS modules (autres fichiers du projet). Python les trouve car ils
+# sont dans le même dossier (le « package » courant).
 from catalog_reader import PhotoRecord
 from log_panel import get_logger
 
-# Extensions considérées comme RAW (décodées par rawpy).
+# PYTHON — SET LITTÉRAL : { "a", "b", ... }. Des accolades AVEC des valeurs (et
+# non des paires clé:valeur) = un set, pas un dict. Sert ici de table de
+# correspondance pour un test d'appartenance O(1) (`ext in _RAW_EXT`).
 _RAW_EXT = {
     "nef", "cr2", "cr3", "arw", "raf", "rw2", "dng", "orf", "pef",
     "srw", "raw", "rwl", "iiq", "3fr", "fff", "nrw", "kdc", "dcr",
 }
 
 
+# PYTHON — ENUM qui hérite AUSSI de `str` (héritage multiple : `(str, Enum)`).
+# Résultat : chaque membre EST une vraie chaîne ("src_preview" == SourceKind.PREVIEW)
+# tout en étant un membre d'énumération typé. Pratique pour sérialiser/loguer
+# sans conversion. On y accède par SourceKind.PREVIEW et sa valeur par `.value`.
 class SourceKind(str, Enum):
     PREVIEW = "src_preview"
     SMART = "src_smart"
     ORIGINAL = "src_original"
 
 
+# Dataclass sans @property : juste un conteneur de 3 valeurs (struct).
 @dataclass
 class ResolvedImage:
-    image: Image.Image
+    image: Image.Image   # le type est `Image.Image` (classe Image du module Image)
     kind: SourceKind
     path: str          # fichier/source d'où provient l'image (info/debug)
 
 
+# PYTHON — FONCTION LIBRE (hors classe) : tout n'a pas à être dans une classe en
+# Python (contrairement à Java). Une fonction au niveau module est parfaitement
+# idiomatique. Le `_` initial = convention « privé au module ».
 def _load_raw(path: str, max_long_edge: int = 2048) -> Image.Image:
     """Décode un RAW (ou DNG Smart Preview) via rawpy en RGB Pillow."""
     import rawpy  # import paresseux : lourd, pas requis pour les aperçus standard
 
+    # PYTHON — `with ... as raw:` : context manager (cf. session_cache). rawpy
+    # ferme proprement le fichier à la sortie du bloc, même en cas d'erreur.
     with rawpy.imread(path) as raw:
+        # PYTHON — arguments NOMMÉS dans un appel multi-lignes : parfaitement
+        # lisible et insensible à l'ordre. `rgb` est un tableau numpy (pixels).
         rgb = raw.postprocess(
             use_camera_wb=True,
             no_auto_bright=False,
             output_bps=8,
             half_size=True,  # demi-résolution : suffisant et bien plus rapide
         )
+    # Image.fromarray = construit une image Pillow depuis le tableau numpy.
     im = Image.fromarray(rgb)
+    # .thumbnail((w, h)) redimensionne EN PLACE en gardant le ratio (max w×h).
+    # Le tuple (x, y) est un couple immuable, très utilisé pour les dimensions.
     im.thumbnail((max_long_edge, max_long_edge))
     return im
 
@@ -81,6 +102,9 @@ class StandardPreviewSource:
         self.dir = Path(previews_dir)
         self._prev_db = self.dir / "previews.db"
         self._root_db = self.dir / "root-pixels.db"
+        # PYTHON — on initialise les connexions à None : elles seront ouvertes
+        # PARESSEUSEMENT (lazy) au 1er besoin, voir _pyramid(). Annotation
+        # `sqlite3.Connection | None` = « une connexion ou None ».
         self._pconn: sqlite3.Connection | None = None
         self._rconn: sqlite3.Connection | None = None
 
@@ -88,6 +112,9 @@ class StandardPreviewSource:
     def available(self) -> bool:
         return self._prev_db.is_file()
 
+    # PYTHON — LAZY INITIALIZATION : on n'ouvre la connexion qu'au 1er appel, puis
+    # on la réutilise. Le `if self._pconn is None` est le test « pas encore créé ».
+    # `is None` (et non `== None`) est l'idiome correct pour tester la nullité.
     def _pyramid(self) -> sqlite3.Connection:
         if self._pconn is None:
             self._pconn = sqlite3.connect(
@@ -96,18 +123,27 @@ class StandardPreviewSource:
         return self._pconn
 
     def _rootpixels(self) -> sqlite3.Connection | None:
+        # `and` court-circuite : si _rconn n'est pas None, on n'évalue pas la suite.
         if self._rconn is None and self._root_db.is_file():
             self._rconn = sqlite3.connect(
                 f"file:{self._root_db}?mode=ro&immutable=1", uri=True
             )
         return self._rconn
 
+    # PYTHON — @staticmethod : méthode SANS `self` (ne dépend pas de l'instance).
+    # Comme une fonction utilitaire, mais rangée dans la classe par cohérence.
     @staticmethod
     def _extract_jpeg(data: bytes) -> bytes | None:
+        # PYTHON — `b"..."` = littéral BYTES (octets bruts), distinct d'une str
+        # (texte). `\xff` = un octet en hexa. .find() renvoie l'index ou -1.
+        # On cherche les marqueurs JPEG : début FFD8FF, fin FFD9.
         soi = data.find(b"\xff\xd8\xff")
-        eoi = data.rfind(b"\xff\xd9")
+        eoi = data.rfind(b"\xff\xd9")  # rfind = depuis la FIN
         if soi == -1 or eoi == -1 or eoi <= soi:
             return None
+        # PYTHON — SLICING : data[debut:fin] extrait une sous-séquence (fin
+        # exclue). Marche sur bytes, str, list... `data[soi:eoi+2]` = du début
+        # jusqu'à inclure les 2 octets de fin FFD9.
         return data[soi : eoi + 2]
 
     def load(self, rec: PhotoRecord) -> Image.Image | None:
@@ -255,7 +291,8 @@ class OriginalFileSource:
 class ImageResolver:
     """Applique la cascade de sources dans l'ordre de priorité demandé."""
 
-    # Ordre par défaut : aperçu standard, puis smart preview, puis original.
+    # PYTHON — attribut de classe = TUPLE (parenthèses, immuable). Sert d'ordre
+    # par défaut. Un tuple convient pour une séquence figée de constantes.
     DEFAULT_ORDER = (SourceKind.PREVIEW, SourceKind.SMART, SourceKind.ORIGINAL)
 
     def __init__(
@@ -272,6 +309,9 @@ class ImageResolver:
         self.log = get_logger()
 
     def _try(self, kind: SourceKind, rec: PhotoRecord) -> Image.Image | None:
+        # PYTHON — `is` compare l'IDENTITÉ (même objet), pas l'égalité. Pour les
+        # membres d'Enum (singletons), c'est l'idiome correct. Pas de switch/case
+        # natif avant 3.10 ; ici une cascade de if suffit.
         if kind is SourceKind.PREVIEW:
             return self._standard.load(rec)
         if kind is SourceKind.SMART:
@@ -280,9 +320,11 @@ class ImageResolver:
 
     def resolve(self, rec: PhotoRecord) -> ResolvedImage | None:
         """Renvoie la première image obtenue selon la cascade, ou None."""
+        # On essaie chaque source dans l'ordre ; la 1re qui renvoie une image gagne.
         for kind in self.order:
             img = self._try(kind, rec)
             if img is not None:
+                # Retour anticipé dès qu'une source aboutit (court-circuite la cascade).
                 return ResolvedImage(image=img, kind=kind, path=rec.display_name)
         self.log.warning(
             "%s : AUCUNE source disponible (ni aperçu, ni Smart Preview, ni original) — ignorée",

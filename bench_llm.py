@@ -95,8 +95,11 @@ def run_bench(
     for model in models:
         times = per_model_times[model]
         ntags = per_model_ntags[model]
-        if not times:
+        if not times:   # liste vide -> on saute ce modèle
             continue
+        # PYTHON — module `statistics` (stdlib) : médiane, moyenne... directement,
+        # sans dépendance externe. median est robuste aux valeurs aberrantes
+        # (1re photo lente à cause du chargement du modèle).
         med = statistics.median(times)
         avg = statistics.mean(times)
         avg_tags = statistics.mean(ntags)

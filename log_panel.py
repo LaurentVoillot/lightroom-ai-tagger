@@ -34,6 +34,9 @@ class RunStats:
     """Petit agrégateur de statistiques pour le récapitulatif de fin de run."""
 
     def __init__(self) -> None:
+        # PYTHON — Counter (de `collections`) : un dict spécialisé pour compter.
+        # Toute clé absente vaut 0 par défaut, donc `counter[k] += 1` marche même
+        # si k n'existait pas (pas de KeyError). Idéal pour des compteurs nommés.
         self.counter: Counter[str] = Counter()
 
     def bump(self, key: str, n: int = 1) -> None:
@@ -41,6 +44,9 @@ class RunStats:
 
     def summary_lines(self) -> list[str]:
         c = self.counter
+        # PYTHON — OPÉRATEUR `%` sur les strings = formatage à la printf :
+        # "%d photos" % n insère n. `c.get(k, 0)` lit avec défaut 0. (C'est l'ancien
+        # style ; f-strings et .format() sont les alternatives modernes.)
         lines = [
             "=== Terminé : %d photos traitées ===" % c.get("processed", 0),
             "  via aperçu standard : %d" % c.get("src_preview", 0),
@@ -111,11 +117,19 @@ def setup_logger(
     )
 
     # Console : une seule fois (évite la duplication des lignes).
+    # PYTHON — getattr(obj, "nom", defaut) : lit un attribut par son NOM (string),
+    # avec une valeur de repli si absent (pas d'AttributeError). Le pendant de
+    # setattr/hasattr. Utile quand le nom est dynamique ou peut ne pas exister.
     if not getattr(logger, "_phototagger_console", False):
         console = logging.StreamHandler()
         console.setLevel(level)
         console.setFormatter(fmt)
         logger.addHandler(console)
+        # PYTHON — MONKEY-PATCHING : on AJOUTE un attribut arbitraire sur un objet
+        # existant (ici le logger de la stdlib) à la volée. Python le permet sur
+        # la plupart des objets. On s'en sert comme « marqueur » mémorisé sur
+        # l'objet. `# type: ignore` fait taire le vérificateur de types (cet
+        # attribut n'est pas déclaré sur la classe Logger).
         logger._phototagger_console = True  # type: ignore[attr-defined]
 
     # Fichier + stats : on retire les anciens (marqués) avant d'en remettre,

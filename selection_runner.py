@@ -56,11 +56,16 @@ from log_panel import RunStats, setup_logger
 def ask_yes_no(question: str, default: bool) -> bool:
     suffix = " [O/n] " if default else " [o/N] "
     try:
+        # PYTHON — input(prompt) : lit une ligne au clavier (stdin), renvoie une
+        # str. CHAÎNAGE de méthodes : .strip() enlève les espaces, .lower() met en
+        # minuscules — chaque méthode renvoie une nouvelle str sur laquelle on
+        # enchaîne. EOFError survient si stdin est fermé (entrée redirigée/vide).
         ans = input(question + suffix).strip().lower()
     except EOFError:
         return default
-    if not ans:
+    if not ans:           # chaîne vide -> on garde le défaut
         return default
+    # `x in (a, b, c)` : appartenance à un tuple. Vrai si ans vaut l'un d'eux.
     return ans in ("o", "oui", "y", "yes")
 
 

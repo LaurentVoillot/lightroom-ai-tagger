@@ -22,14 +22,24 @@ L'UUID (id_global) sert de clé commune pour retrouver l'aperçu standard
 from __future__ import annotations
 
 import sqlite3
+# PYTHON — `dataclass` : décorateur qui génère automatiquement __init__,
+# __repr__, __eq__... à partir des champs déclarés (voir PhotoRecord ci-dessous).
 from dataclasses import dataclass
 from pathlib import Path
 
 
+# PYTHON — DÉCORATEUR `@dataclass` : un décorateur est une fonction qui « enveloppe »
+# la classe/fonction suivante pour la transformer. @dataclass lit les annotations de
+# champs du corps de la classe et génère le boilerplate. Ici, déclarer `uuid: str`
+# etc. SUFFIT : @dataclass crée le constructeur PhotoRecord(uuid=..., file_uuid=...).
+# C'est l'équivalent d'un `record`/`struct`/POJO. Contrairement à une classe
+# normale, les champs SONT déclarés dans le corps (avec leur type).
 @dataclass
 class PhotoRecord:
     """Une photo du catalogue, telle que nécessaire pour le tagging."""
 
+    # Chaque ligne = un champ + son type. `str | None` (= Optional[str]) signifie
+    # « une chaîne OU None (null) ». Python n'impose pas le type, c'est documentaire.
     uuid: str                 # Adobe_images.id_global (clé des aperçus standard previews.db)
     file_uuid: str            # AgLibraryFile.id_global (clé des Smart Previews .dng)
     image_id: int             # Adobe_images.id_local
@@ -44,9 +54,16 @@ class PhotoRecord:
     month: int | None
     day: int | None
 
+    # PYTHON — `@property` : transforme une méthode en attribut CALCULÉ en lecture
+    # seule. On écrit `rec.original_path` (SANS parenthèses), pas
+    # `rec.original_path()`. C'est un « getter » implicite (comme une propriété C#).
     @property
     def original_path(self) -> str:
         """Chemin attendu du fichier original sur disque."""
+        # PYTHON — l'opérateur `/` est SURCHARGÉ sur les Path : Path("a") / "b.jpg"
+        # construit le chemin "a/b.jpg" (séparateur géré selon l'OS). Bien plus sûr
+        # qu'une concaténation de strings. f"...{x}..." = f-STRING : interpolation
+        # de variables/expressions directement dans la chaîne (comme `${x}`).
         return str(Path(self.folder_abs) / f"{self.base_name}.{self.extension}")
 
     @property
@@ -65,6 +82,9 @@ class CatalogReader:
     def __init__(self, lrcat_path: str | Path, immutable: bool = True):
         self.lrcat_path = Path(lrcat_path)
         if not self.lrcat_path.is_file():
+            # PYTHON — `raise` lève une exception (comme throw). FileNotFoundError
+            # est une exception standard. Pas de checked exceptions en Python : on
+            # ne déclare pas ce qu'une fonction peut lever.
             raise FileNotFoundError(f"Catalogue introuvable : {self.lrcat_path}")
         # immutable=1 => aucun verrou, lecture la plus rapide, MAIS le cache est
         # figé : à éviter si un CatalogWriter écrit le même fichier en parallèle.
@@ -73,7 +93,11 @@ class CatalogReader:
             uri = f"file:{self.lrcat_path}?mode=ro&immutable=1"
         else:
             uri = f"file:{self.lrcat_path}?mode=ro"
+        # uri=True : interpréter le 1er argument comme une URI SQLite (et non un
+        # simple chemin de fichier), ce qui permet les paramètres ?mode=ro...
         self.conn = sqlite3.connect(uri, uri=True)
+        # row_factory = sqlite3.Row : chaque ligne devient un objet indexable par
+        # NOM de colonne (row["uuid"]) en plus de l'index (row[0]) — comme un dict.
         self.conn.row_factory = sqlite3.Row
 
     def close(self) -> None:
@@ -90,6 +114,9 @@ class CatalogReader:
     @property
     def previews_dir(self) -> Path:
         """<Catalogue> Previews.lrdata (aperçus standard)."""
+        # PYTHON — méthodes Path utiles : .stem = nom de fichier SANS extension
+        # ("LR-v15" pour "LR-v15.lrcat"), .with_name(x) = remplace le dernier
+        # segment du chemin par x (en gardant le dossier parent).
         return self.lrcat_path.with_name(self.lrcat_path.stem + " Previews.lrdata")
 
     @property
@@ -107,6 +134,9 @@ class CatalogReader:
 
     # -- Requêtes ----------------------------------------------------------
 
+    # PYTHON — ATTRIBUT DE CLASSE : défini directement dans le corps de la classe
+    # (pas dans __init__, pas de `self`). Il est PARTAGÉ par toutes les instances
+    # (~static/const). Ici une constante SQL réutilisée par plusieurs méthodes.
     _BASE_QUERY = """
         SELECT
             i.id_global              AS uuid,
@@ -131,9 +161,15 @@ class CatalogReader:
     """
 
     def _row_to_record(self, r: sqlite3.Row) -> PhotoRecord:
+        # PYTHON — `a or b` ne renvoie PAS un booléen mais la 1re valeur
+        # « vraie » : si r["root_abs"] est None/"" (falsy), on prend "". Idiome
+        # courant pour fournir une valeur par défaut (équiv. `?? ""`).
         folder_abs = (r["root_abs"] or "") + (r["path_from_root"] or "")
         # pathFromRoot se termine par '/', on retire le slash final pour Path.
         folder_abs = folder_abs.rstrip("/")
+        # PYTHON — appel avec ARGUMENTS NOMMÉS (uuid=..., file_uuid=...) : rend
+        # l'appel auto-documenté et insensible à l'ordre. Possible sur tout
+        # constructeur/fonction. bool(x) convertit explicitement (0/1 -> False/True).
         return PhotoRecord(
             uuid=r["uuid"],
             file_uuid=r["file_uuid"],
@@ -174,10 +210,18 @@ class CatalogReader:
         row = self.conn.execute(
             "SELECT value FROM Adobe_variablesTable WHERE name = 'Adobe_selectedImages'"
         ).fetchone()
+        # PYTHON — `not row` est vrai si row est None (aucune ligne) ; `not row[0]`
+        # si la valeur est vide. `[]` = liste vide littérale (retour anticipé).
         if not row or not row[0]:
             return []
+        # PYTHON — import LOCAL (dans une fonction) : `re` (regex) n'est chargé que
+        # si on arrive ici. Légitime pour un module lourd/rarement utilisé.
         import re
 
+        # PYTHON — LIST COMPREHENSION : [ expr for x in iterable ]. Équivaut à une
+        # boucle qui construit une liste. re.findall(r"\d+", s) renvoie toutes les
+        # suites de chiffres ; on les convertit en int. `r"..."` = RAW STRING
+        # (backslashes littéraux, indispensable pour les regex).
         return [int(x) for x in re.findall(r"\d+", str(row[0]))]
 
     def iter_photos(
@@ -200,6 +244,8 @@ class CatalogReader:
           pas sur le disque et qui, par tri alphabétique, passent en tête.
         - limit : limite le nombre de résultats (utile pour les tests).
         """
+        # On construit dynamiquement la clause WHERE : une liste de fragments SQL
+        # et une liste parallèle de paramètres `?`.
         sql = self._BASE_QUERY
         where = []
         params: list = []
@@ -209,6 +255,10 @@ class CatalogReader:
         if gps_only:
             where.append("COALESCE(ex.hasGPS, 0) = 1")
         if image_ids:
+            # PYTHON — "?" * n RÉPÈTE la chaîne n fois ("???"), puis ",".join(...)
+            # insère une virgule entre chaque caractère -> "?,?,?". On génère ainsi
+            # autant de placeholders que d'ids. .extend() ajoute tous les éléments
+            # d'une liste à une autre (vs .append() qui ajoute UN élément).
             placeholders = ",".join("?" * len(image_ids))
             where.append(f"i.id_local IN ({placeholders})")
             params.extend(image_ids)
@@ -216,12 +266,20 @@ class CatalogReader:
             where.append(
                 "fl.id_global IN (SELECT fileUUID FROM AgDNGProxyInfo)"
             )
+        # `if where:` est vrai si la liste est NON vide (une liste vide est falsy).
         if where:
+            # " AND ".join(liste) assemble les fragments avec " AND " entre eux.
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY rf.absolutePath, f.pathFromRoot, fl.baseName"
         if limit:
             sql += f" LIMIT {int(limit)}"
 
+        # PYTHON — GÉNÉRATEUR : cette fonction contient `yield`, donc l'appeler ne
+        # l'EXÉCUTE PAS immédiatement — elle renvoie un itérateur paresseux. À
+        # chaque tour de boucle de l'appelant, le code reprend jusqu'au prochain
+        # `yield`, qui produit une valeur. Avantage ÉNORME ici : on ne charge
+        # jamais 200 000 PhotoRecord en mémoire ; on en produit un à la fois,
+        # à la demande. C'est l'équivalent de IEnumerable/yield return en C#.
         for r in self.conn.execute(sql, params):
             yield self._row_to_record(r)
 

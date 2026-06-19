@@ -51,11 +51,13 @@ def _flush_log(log) -> None:
 
 def _folder_numbers(records: list[PhotoRecord]) -> dict[str, str]:
     """Attribue un numéro stable à chaque dossier rencontré (0001, 0002, ...)."""
-    mapping: dict[str, str] = {}
+    mapping: dict[str, str] = {}   # dict vide ; {} seul = dict (pas set)
     n = 0
     for r in records:
-        if r.folder_abs not in mapping:
+        if r.folder_abs not in mapping:   # `not in` sur un dict = clé absente
             n += 1
+            # PYTHON — FORMAT SPEC dans une f-string : f"{n:04d}" = entier sur 4
+            # chiffres avec zéros à gauche ("0001"). Équivaut à printf("%04d").
             mapping[r.folder_abs] = f"{n:04d}"
     return mapping
 
@@ -80,6 +82,7 @@ def run_test(
     hierarchical: bool = False,
     resume: bool = False,
     progress_cb=None,
+    stop_flag: str | None = None,
 ) -> None:
     out = Path(out_dir) if out_dir else Path.cwd()
     stats = RunStats()
@@ -158,9 +161,13 @@ def run_test(
         # explicite. Évite que les photos cloud (Mobile Downloads, sans pixels
         # sur disque), placées en tête par le tri, saturent la limite.
         sp_only = not selected_only
+        # En mode reprise, la limite (taille de lot) doit s'appliquer APRÈS le
+        # filtre des photos déjà faites — sinon on re-sélectionne toujours les
+        # mêmes premières photos. On ne limite donc pas la requête SQL ici.
+        sql_limit = None if resume else limit
         records = list(
             cat.iter_photos(
-                folder_substring=scope, gps_only=gps_only, limit=limit,
+                folder_substring=scope, gps_only=gps_only, limit=sql_limit,
                 image_ids=image_ids, with_smart_preview_only=sp_only,
             )
         )
@@ -201,6 +208,9 @@ def run_test(
                     "précédente — ignorée(s) (%d déjà en base).",
                     resumed, session.count(),
                 )
+            # La limite (taille de lot) s'applique APRÈS le filtre de reprise.
+            if limit:
+                records = records[:limit]
 
         # Pré-vol : on ne vérifie les volumes des originaux que s'ils sont
         # réellement dans la cascade (sinon inutile de bloquer).
@@ -230,11 +240,28 @@ def run_test(
 
         total_records = len(records)
         log.info("Début du traitement de %d photo(s)…", total_records)
+        # PYTHON — EXPRESSION CONDITIONNELLE (ternaire) : `A if cond else B`
+        # (l'ordre diffère de cond?A:B). Ici : Path(stop_flag) si fourni, sinon None.
+        stop_path = Path(stop_flag) if stop_flag else None
+        # PYTHON — enumerate(seq, 1) : itère en donnant (index, élément), index
+        # démarrant à 1. Évite le classique `i = 0; i += 1`. Sans le `, 1`, l'index
+        # commence à 0. On déballe directement en `idx, rec`.
         for idx, rec in enumerate(records, 1):
+            # Arrêt propre demandé (bouton Stop) : on sort à la fin de la photo
+            # précédente, tout est déjà commité/flushé. Le stop.flag est laissé
+            # en place pour que le batch_runner s'arrête aussi entre deux lots.
+            if stop_path is not None and stop_path.exists():
+                log.info("Arrêt demandé — interruption propre après %d photo(s).",
+                         idx - 1)
+                break
             if progress_cb is not None:
                 progress_cb(idx, total_records, rec.display_name)
             # Log de progression visible (toutes les photos) + flush, pour suivre
             # un gros run en direct dans le fichier log.
+            # PYTHON — logging avec args SÉPARÉS (pas de f-string ici !) :
+            # log.info("[%d/%d] %s", a, b, c) -> le formatage %d/%s n'est fait que
+            # SI le message est réellement émis (niveau actif). Plus efficace que
+            # f"[{a}]" qui formate toujours. C'est le style recommandé du module logging.
             log.info("[%d/%d] %s", idx, total_records, rec.display_name)
             _flush_log(log)
             resolved: ResolvedImage | None = resolver.resolve(rec)
@@ -311,6 +338,8 @@ def run_test(
 
             # Mémorise la photo comme traitée (reprise de session), commit tous
             # les 10 — assez fréquent pour une reprise fiable après un arrêt.
+            # PYTHON — `idx % 10 == 0` (modulo) : vrai un tour sur 10. L'expression
+            # booléenne est passée telle quelle au paramètre `commit=`.
             if session is not None:
                 session.mark(rec.file_uuid, rec.display_name, len(all_tags),
                              commit=(idx % 10 == 0))
@@ -399,11 +428,19 @@ def _parse_order(spec: str) -> tuple[SourceKind, ...]:
     return tuple(out)
 
 
+# PYTHON — point d'entrée CLI. argparse = parseur d'arguments de ligne de commande
+# de la stdlib. On déclare les arguments, il gère le parsing, --help, les erreurs.
 def main() -> None:
     ap = argparse.ArgumentParser(description="Mode test (lecture seule) du Photo Tagger")
+    # add_argument("lrcat", ...) = argument POSITIONNEL (obligatoire) ;
+    # add_argument("--scope", ...) = argument OPTIONNEL (préfixe --). `type=int`
+    # convertit automatiquement ; sans `type`, c'est une str.
     ap.add_argument("lrcat", help="Chemin du catalogue .lrcat")
     ap.add_argument("--scope", help="Sous-chaîne de chemin de dossier (périmètre)")
     ap.add_argument("--limit", type=int, help="Limiter le nombre de photos")
+    # PYTHON — action="store_true" : argument-DRAPEAU. Présent -> True, absent ->
+    # False. Pas de valeur à fournir (ex. `--gps-only`). argparse convertit aussi
+    # `--gps-only` en attribut `args.gps_only` (tiret -> underscore).
     ap.add_argument("--gps-only", action="store_true", help="Photos géolocalisées uniquement")
     ap.add_argument(
         "--order",
@@ -463,5 +500,10 @@ def main() -> None:
     )
 
 
+# PYTHON — IDIOME FONDAMENTAL : `if __name__ == "__main__":`. Chaque module a une
+# variable `__name__`. Si le fichier est LANCÉ directement (python test_report.py),
+# __name__ vaut "__main__" et on exécute main(). S'il est IMPORTÉ par un autre
+# module, __name__ vaut "test_report" et ce bloc ne s'exécute PAS. C'est ce qui
+# permet à un fichier d'être à la fois une bibliothèque ET un script exécutable.
 if __name__ == "__main__":
     main()
