@@ -572,8 +572,39 @@ class MainWindow(QWidget):
         )
 
 
+def _check_dependencies() -> list[str]:
+    """Renvoie la liste des modules requis manquants (pour décodage des images)."""
+    manquants = []
+    for mod in ("tifffile", "imagecodecs", "rawpy", "PIL"):
+        try:
+            __import__(mod)
+        except ImportError:
+            manquants.append(mod)
+    return manquants
+
+
 def main() -> None:
     app = QApplication(sys.argv)
+
+    # Garde-fou : si on a été lancé avec le mauvais Python (sans les libs de
+    # décodage), on prévient CLAIREMENT au lieu d'échouer photo par photo
+    # (« Smart Preview illisible (No module named 'tifffile') »).
+    manquants = _check_dependencies()
+    if manquants:
+        from PyQt6.QtWidgets import QMessageBox
+
+        QMessageBox.critical(
+            None,
+            "Dépendances manquantes",
+            "Modules requis absents : " + ", ".join(manquants) + ".\n\n"
+            "Tu as probablement lancé l'app avec le mauvais Python.\n"
+            "Lance plutôt via « lancer_gui.command » (double-clic), ou en "
+            "terminal :\n    ./.venv/bin/python gui.py\n\n"
+            "Sinon, installe les dépendances :\n"
+            "    ./.venv/bin/pip install -r requirements.txt",
+        )
+        sys.exit(1)
+
     win = MainWindow()
     # Pré-remplit : catalogue par défaut, sinon dernier valide mémorisé.
     # Le défaut est priorisé pour ne jamais retomber sur le catalogue cloud.
