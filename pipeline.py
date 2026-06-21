@@ -132,6 +132,7 @@ class OllamaVision:
         jpeg_quality: int = 80,
         max_edge: int = 1024,
         timeout: int = 300,
+        num_gpu: int | None = None,
     ):
         self.model = model
         self.url = host.rstrip("/") + "/api/generate"
@@ -139,7 +140,18 @@ class OllamaVision:
         self.jpeg_quality = jpeg_quality
         self.max_edge = max_edge
         self.timeout = timeout
+        # num_gpu = nombre de couches du modèle déchargées sur le GPU (option
+        # Ollama). None = Ollama décide seul ; 0 = tout CPU (GPU libre, lent) ;
+        # valeur élevée (>= nb de couches) = tout GPU (rapide, GPU saturé).
+        self.num_gpu = num_gpu
         self.log = get_logger()
+
+    def _options(self) -> dict:
+        """Options passées à Ollama. num_gpu n'est ajouté que s'il est défini."""
+        opts = {"temperature": self.temperature}
+        if self.num_gpu is not None:
+            opts["num_gpu"] = self.num_gpu
+        return opts
 
     def _encode(self, img) -> str:
         im = img.convert("RGB").copy()
@@ -199,7 +211,9 @@ class OllamaVision:
                     "prompt": prompt,
                     "images": [self._encode(img)],
                     "stream": False,
-                    "options": {"temperature": self.temperature},
+                    # `options` Ollama : on n'ajoute num_gpu QUE s'il est défini,
+                    # via un dict de base + insertion conditionnelle.
+                    "options": self._options(),
                 },
                 timeout=self.timeout,
             )

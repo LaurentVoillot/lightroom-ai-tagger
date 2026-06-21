@@ -83,6 +83,7 @@ def run_test(
     resume: bool = False,
     progress_cb=None,
     stop_flag: str | None = None,
+    num_gpu: int | None = None,
 ) -> None:
     out = Path(out_dir) if out_dir else Path.cwd()
     stats = RunStats()
@@ -117,7 +118,8 @@ def run_test(
             cache_dir=out / "gps_cache", online_species=online_species
         )
         pipeline = TaggingPipeline(
-            ollama=OllamaVision(model=model), gps=gps, use_species_pass=species_pass
+            ollama=OllamaVision(model=model, num_gpu=num_gpu),
+            gps=gps, use_species_pass=species_pass
         )
         log.info(
             "Tagging ACTIVÉ (modèle passe 1 : %s, passe 2 espèces : %s)",

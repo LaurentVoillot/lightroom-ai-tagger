@@ -24,7 +24,7 @@ import logging
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -183,7 +184,7 @@ class MainWindow(QWidget):
         og.addWidget(self.skip_tagged_check, 0, 3)
 
         self.resume_check = QCheckBox("Reprendre (ignorer les photos déjà traitées)")
-        og.addWidget(self.resume_check, 4, 0, 1, 2)
+        og.addWidget(self.resume_check, 5, 0, 1, 2)
 
         self.order_combo = QComboBox()
         self.order_combo.addItems(
@@ -212,9 +213,28 @@ class MainWindow(QWidget):
         self.species_check = QCheckBox("Passe 2 espèces (BioCLIP, expérimental)")
         og.addWidget(self.species_check, 2, 2)
 
+        # --- Curseur GPU (occupation du GPU par le LLM) ---
+        # Mappe 0–100 % sur le nombre de couches déchargées sur le GPU (num_gpu
+        # d'Ollama). 100 % = tout GPU (rapide, GPU saturé) ; 0 % = tout CPU (GPU
+        # libre, très lent). Défaut 70 % : laisse de la marge pour rester fluide.
+        og.addWidget(QLabel("GPU LLM :"), 3, 0)
+        gpu_row = QHBoxLayout()
+        self.gpu_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gpu_slider.setRange(0, 100)
+        self.gpu_slider.setValue(70)
+        self.gpu_slider.setTickInterval(10)
+        self.gpu_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.gpu_label = QLabel("70 %")
+        self.gpu_slider.valueChanged.connect(
+            lambda v: self.gpu_label.setText(f"{v} %")
+        )
+        gpu_row.addWidget(self.gpu_slider)
+        gpu_row.addWidget(self.gpu_label)
+        og.addLayout(gpu_row, 3, 1, 1, 2)
+
         self.out_edit = QLineEdit(str(Path.home() / "phototagger_out"))
-        og.addWidget(QLabel("Sortie :"), 3, 0)
-        og.addWidget(self.out_edit, 3, 1, 1, 2)
+        og.addWidget(QLabel("Sortie :"), 4, 0)
+        og.addWidget(self.out_edit, 4, 1, 1, 2)
         root.addWidget(opt)
 
         # --- Écriture (mode test vs écriture réelle) ---
@@ -499,6 +519,15 @@ class MainWindow(QWidget):
         if Path(self._stop_flag_path).exists():
             Path(self._stop_flag_path).unlink()
 
+        # Curseur GPU -> num_gpu (couches déchargées sur le GPU). On mappe 0-100 %
+        # sur 0..N couches. 100 % => 999 (force tout sur GPU ; Ollama plafonne au
+        # nombre réel de couches du modèle). 0 % => 0 (tout CPU).
+        gpu_pct = self.gpu_slider.value()
+        if gpu_pct >= 100:
+            num_gpu = 999
+        else:
+            num_gpu = round(gpu_pct / 100 * 48)  # base 48 (couches qwen3-vl:30b)
+
         params = dict(
             lrcat=lrcat,
             scope=scope,
@@ -518,6 +547,7 @@ class MainWindow(QWidget):
             hierarchical=(not test_mode) and self.hier_check.isChecked(),
             resume=self.resume_check.isChecked(),
             stop_flag=self._stop_flag_path,
+            num_gpu=num_gpu,
         )
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
