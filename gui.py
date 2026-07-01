@@ -123,6 +123,7 @@ class MainWindow(QWidget):
         self.resize(900, 700)
         self._thread: QThread | None = None
         self._counts = {"info": 0, "warning": 0, "error": 0}
+        self._armed = False  # confirmation « double-clic » avant écriture réelle
         from PyQt6.QtCore import QSettings
 
         self._settings = QSettings("phototagger", "lightroom-ai-tagger")
@@ -446,6 +447,8 @@ class MainWindow(QWidget):
         self.catalog_check.setEnabled(not checked)
         self.suffix_edit.setEnabled(not checked)
         self.hier_check.setEnabled(not checked)
+        # Changer de mode annule une confirmation en attente (bouton « armé »).
+        self._armed = False
         self.run_btn.setText("Lancer le mode test" if checked else "Lancer le taggage")
 
     def _run(self) -> None:
@@ -453,24 +456,6 @@ class MainWindow(QWidget):
         if not lrcat or not Path(lrcat).is_file():
             self.status.setText("Choisis d'abord un catalogue valide.")
             return
-
-        # Avertissement NON bloquant : si le catalogue semble inadapté
-        # (cloud/mobile), on prévient mais on laisse l'utilisateur confirmer —
-        # certains catalogues cloud sont volontairement traités.
-        ok, msg = self._diagnose_catalog(lrcat)
-        if not ok:
-            from PyQt6.QtWidgets import QMessageBox
-
-            resp = QMessageBox.question(
-                self,
-                "Catalogue inhabituel",
-                msg + "\n\nLancer quand même ?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if resp != QMessageBox.StandardButton.Yes:
-                self.status.setText(msg)
-                return
 
         test_mode = self.test_check.isChecked()
         write_xmp = (not test_mode) and self.xmp_check.isChecked()
@@ -486,24 +471,36 @@ class MainWindow(QWidget):
                 )
                 return
 
-        # Confirmation avant toute écriture réelle.
-        if write_xmp or write_catalog:
-            cibles = []
-            if write_xmp:
-                cibles.append("sidecars .xmp")
-            if write_catalog:
-                cibles.append("base Lightroom")
-            from PyQt6.QtWidgets import QMessageBox
-
-            resp = QMessageBox.question(
-                self,
-                "Confirmer l'écriture",
-                "Écriture RÉELLE (non destructive) dans : "
-                + " + ".join(cibles)
-                + f"\nSuffixe : « {self.suffix_edit.text()} ».\n\nContinuer ?",
-            )
-            if resp != QMessageBox.StandardButton.Yes:
-                return
+        # CONFIRMATION SANS DIALOGUE MODAL (les QMessageBox crashent sur macOS 27
+        # bêta). On confirme par un DOUBLE CLIC sur « Lancer » : le 1er clic
+        # affiche l'avertissement dans la barre d'état et « arme » le bouton ; le
+        # 2e clic (tant que la même config est armée) lance réellement.
+        ok, cat_msg = self._diagnose_catalog(lrcat)
+        besoin_confirmation = (not ok) or write_xmp or write_catalog
+        if besoin_confirmation and not getattr(self, "_armed", False):
+            avert = []
+            if not ok:
+                avert.append(cat_msg)
+            if write_xmp or write_catalog:
+                cibles = []
+                if write_xmp:
+                    cibles.append("sidecars .xmp")
+                if write_catalog:
+                    cibles.append("base Lightroom")
+                avert.append(
+                    "Écriture RÉELLE (non destructive) dans "
+                    + " + ".join(cibles)
+                    + f" (suffixe « {self.suffix_edit.text()} »)."
+                )
+            self._armed = True
+            self.run_btn.setText("⚠ Re-cliquer pour CONFIRMER")
+            self.status.setText("  ·  ".join(avert) + "  →  clique à nouveau pour lancer.")
+            return
+        # 2e clic (ou aucune confirmation nécessaire) : on désarme et on lance.
+        self._armed = False
+        self.run_btn.setText(
+            "Lancer le mode test" if test_mode else "Lancer le taggage"
+        )
 
         limit = self.limit_spin.value() or None
         # Périmètre : 0 = dossier, 1 = sélection courante, 2 = tout le catalogue.
@@ -626,25 +623,21 @@ def main() -> None:
     app = QApplication(sys.argv)
 
     # Garde-fou : si on a été lancé avec le mauvais Python (sans les libs de
-    # décodage), on prévient CLAIREMENT au lieu d'échouer photo par photo
-    # (« Smart Preview illisible (No module named 'tifffile') »).
+    # décodage), on prévient. PAS de QMessageBox (crash macOS 27 bêta) : message
+    # console + affiché dans la barre d'état de la fenêtre (non-modal).
     manquants = _check_dependencies()
+    dep_msg = ""
     if manquants:
-        from PyQt6.QtWidgets import QMessageBox
-
-        QMessageBox.critical(
-            None,
-            "Dépendances manquantes",
-            "Modules requis absents : " + ", ".join(manquants) + ".\n\n"
-            "Tu as probablement lancé l'app avec le mauvais Python.\n"
-            "Lance plutôt via « lancer_gui.command » (double-clic), ou en "
-            "terminal :\n    ./.venv/bin/python gui.py\n\n"
-            "Sinon, installe les dépendances :\n"
-            "    ./.venv/bin/pip install -r requirements.txt",
+        dep_msg = (
+            "⚠ Modules requis absents : " + ", ".join(manquants)
+            + " — lance via « lancer_gui.command » ou ./.venv/bin/python gui.py "
+            "(ou : ./.venv/bin/pip install -r requirements.txt)."
         )
-        sys.exit(1)
+        print(dep_msg, file=sys.stderr)  # visible dans le terminal
 
     win = MainWindow()
+    if dep_msg:
+        win.status.setText(dep_msg)
     # Pré-remplit : catalogue par défaut, sinon dernier valide mémorisé.
     # Le défaut est priorisé pour ne jamais retomber sur le catalogue cloud.
     default_cat = "/Volumes/X10/LR-v15 copie/LR-v15.lrcat"
