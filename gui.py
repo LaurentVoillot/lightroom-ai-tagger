@@ -614,6 +614,15 @@ def _check_dependencies() -> list[str]:
 
 
 def main() -> None:
+    # CORRECTIF macOS 27 (bêta) : le rendu natif Cocoa des dialogues modaux
+    # (QMessageBox -> NSAlert -> CoreUI/SwiftUI) crashe (SIGABRT) au dessin d'un
+    # glyphe SF Symbol sur cette version d'OS. On force le style « Fusion » (moteur
+    # de rendu propre à Qt, indépendant de Cocoa) : élimine la chaîne qui plante.
+    # Sans effet néfaste sur les versions macOS antérieures.
+    import os as _os
+
+    _os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
+    QApplication.setStyle("Fusion")
     app = QApplication(sys.argv)
 
     # Garde-fou : si on a été lancé avec le mauvais Python (sans les libs de
